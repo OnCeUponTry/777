@@ -1,0 +1,8 @@
+# Opcodes ALLOC + STORE_I64 + LOAD_I64: heap write+read i64
+D 0 0 size Integer 64
+D 0 0 off Integer 0
+D 0 0 val Integer 77
+R 0 0 Alloc [size] buf
+R 0 0 StoreI64 [buf, off, val]
+R 0 0 LoadI64 [buf, off] R
+R 0 0 ExitTop [R]

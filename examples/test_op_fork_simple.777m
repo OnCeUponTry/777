@@ -1,0 +1,5 @@
+# Opcode FORK: opcode no crashea, exit 0 en ambos procesos
+# Padre y hijo pasan por ExitTop[Z]
+D 0 0 zero Integer 0
+R 0 0 Fork [] pid
+R 0 0 ExitTop [zero]

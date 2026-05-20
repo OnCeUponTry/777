@@ -1,0 +1,7 @@
+# Opcode JZ con cond=0 toma jump forward: exit 42 (no 99)
+D 0 0 Z Integer 0
+D 0 0 R Integer 42
+D 0 0 N99 Integer 99
+R 0 0 Jz [Z, 3]
+R 0 0 ExitTop [N99]
+R 0 0 ExitTop [R]

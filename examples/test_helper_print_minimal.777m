@@ -1,0 +1,21 @@
+# Test F que imprime "0\n" sin loop (solo Alloc + StoreByte + FdWrite + Ret)
+D 0 0 fd_out Integer 1
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+D 0 0 two Integer 2
+D 0 0 buf_size Integer 16
+D 0 0 char_zero Integer 48
+D 0 0 newline Integer 10
+D 0 0 buf_p Integer 0
+D 0 0 R Integer 0
+
+F 0 0 print_minimal []
+R 0 0 Alloc [buf_size] buf_p
+R 0 0 StoreByte [buf_p, zero, char_zero]
+R 0 0 StoreByte [buf_p, one, newline]
+R 0 0 FdWrite [fd_out, buf_p, two] R
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [print_minimal]
+R 0 0 ExitTop [zero]

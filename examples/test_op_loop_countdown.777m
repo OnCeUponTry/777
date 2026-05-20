@@ -1,0 +1,11 @@
+# JZ backward + SUB en loop: cuenta atras desde 5 hasta 0, exit 0
+# Loop body bytecode layout:
+#   Sub N One N (7B) | Eq N Z C (7B) | Jz [C, rel] (5B)
+# Post-Jz offset = 19 desde inicio Sub, rel=-19 retrocede a Sub
+D 0 0 N Integer 5
+D 0 0 Z Integer 0
+D 0 0 One Integer 1
+R 0 0 Sub [N, One] N
+R 0 0 Eq [N, Z] C
+R 0 0 Jz [C, -19]
+R 0 0 ExitTop [N]

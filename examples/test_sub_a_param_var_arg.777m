@@ -1,0 +1,14 @@
+# Sub-A test: F con param, Call con var (no literal).
+# double_x [n]: tmp = n * 2, retorna.
+# X = 21; Call double_x con X. Exit tmp = 42.
+D 0 0 X Integer 21
+D 0 0 two Integer 2
+D 0 0 tmp Integer 0
+
+F 0 0 double_x [n]
+R 0 0 Mul [n, two] tmp
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [double_x, X]
+R 0 0 ExitTop [tmp]

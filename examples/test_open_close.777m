@@ -1,0 +1,6 @@
+D 0 0 path Text "/dev/null\0"
+D 0 0 flags Integer 0
+D 0 0 Z Integer 0
+R 0 0 Open [path, flags] fd
+R 0 0 Close [fd] R
+R 0 0 ExitTop [R]

@@ -1,0 +1,11 @@
+# Item 2: sintaxis F + Call [name] con backward reference (F definida antes)
+# Funcion double_x: X *= 2.
+# Programa: F double_x; X=21; Call [double_x] (backward); ExitTop [X] -> exit 42
+F 0 0 double_x []
+R 0 0 Add [X, X] X
+R 0 0 Ret []
+R 0 0 EndF
+D 0 0 X Integer 21
+D 0 0 Z Integer 0
+R 0 0 Call [double_x]
+R 0 0 ExitTop [X]

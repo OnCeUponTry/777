@@ -1,0 +1,45 @@
+# Helper print_int como F reusable.
+# Asume slot pi_n contiene valor a imprimir (positivo). Imprime decimal + newline.
+# pi_n=42 -> stdout "42\n", exit 0
+# Fix: pi_p es OFFSET dentro del buffer, NO direccion absoluta.
+D 0 0 fd_out Integer 1
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+D 0 0 ten Integer 10
+D 0 0 char_zero Integer 48
+D 0 0 newline Integer 10
+D 0 0 buf_size Integer 32
+D 0 0 pi_n Integer 42
+D 0 0 pi_buf Integer 0
+D 0 0 pi_q Integer 0
+D 0 0 pi_p Integer 0
+D 0 0 pi_count Integer 0
+D 0 0 pi_d Integer 0
+D 0 0 pi_start Integer 0
+D 0 0 pi_ptr Integer 0
+D 0 0 pi_done Integer 0
+D 0 0 pi_R Integer 0
+
+F 0 0 print_int []
+R 0 0 Alloc [buf_size] pi_buf
+R 0 0 Sub [buf_size, one] pi_p
+R 0 0 Add [pi_n, zero] pi_q
+R 0 0 StoreByte [pi_buf, pi_p, newline]
+R 0 0 Sub [pi_p, one] pi_p
+R 0 0 Add [zero, one] pi_count
+R 0 0 Mod [pi_q, ten] pi_d
+R 0 0 Add [pi_d, char_zero] pi_d
+R 0 0 StoreByte [pi_buf, pi_p, pi_d]
+R 0 0 Sub [pi_p, one] pi_p
+R 0 0 Add [pi_count, one] pi_count
+R 0 0 Div [pi_q, ten] pi_q
+R 0 0 Eq [pi_q, zero] pi_done
+R 0 0 Jz [pi_done, -54]
+R 0 0 Add [pi_p, one] pi_start
+R 0 0 Add [pi_buf, pi_start] pi_ptr
+R 0 0 FdWrite [fd_out, pi_ptr, pi_count] pi_R
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [print_int]
+R 0 0 ExitTop [zero]

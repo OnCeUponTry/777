@@ -1,0 +1,44 @@
+# Sub-Lote1: Connect a 127.0.0.1:1 (puerto cerrado).
+# Espera -ECONNREFUSED (=-111). Si Connect funciona como opcode, result < 0.
+# Si opcode roto -> SIGSEGV/timeout. Exit 1 = OK (opcode funciona y retorna error esperado).
+#
+# Build sockaddr_in 16 bytes manual:
+#   off 0-1: family AF_INET=2 (little-endian) -> bytes [0x02, 0x00]
+#   off 2-3: port BE -> bytes [0x00, 0x01] (puerto=1)
+#   off 4-7: addr BE 127.0.0.1 -> bytes [0x7F, 0x00, 0x00, 0x01]
+#   off 8-15: padding zero
+
+D 0 0 family Integer 2
+D 0 0 type Integer 1
+D 0 0 protocol Integer 0
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+D 0 0 byte_127 Integer 127
+D 0 0 size Integer 16
+D 0 0 off0 Integer 0
+D 0 0 off1 Integer 1
+D 0 0 off2 Integer 2
+D 0 0 off3 Integer 3
+D 0 0 off4 Integer 4
+D 0 0 off5 Integer 5
+D 0 0 off6 Integer 6
+D 0 0 off7 Integer 7
+
+R 0 0 Socket [family, type, protocol] fd
+R 0 0 Alloc [size] addr_buf
+# family bytes: addr[0]=2 (AF_INET low), addr[1]=0
+R 0 0 StoreByte [addr_buf, off0, family]
+R 0 0 StoreByte [addr_buf, off1, zero]
+# port BE bytes: addr[2]=0, addr[3]=1 (port=1)
+R 0 0 StoreByte [addr_buf, off2, zero]
+R 0 0 StoreByte [addr_buf, off3, one]
+# addr BE bytes: 127, 0, 0, 1
+R 0 0 StoreByte [addr_buf, off4, byte_127]
+R 0 0 StoreByte [addr_buf, off5, zero]
+R 0 0 StoreByte [addr_buf, off6, zero]
+R 0 0 StoreByte [addr_buf, off7, one]
+
+R 0 0 Connect [fd, addr_buf, size] result
+R 0 0 Lt [result, zero] is_error
+R 0 0 Close [fd] cr
+R 0 0 ExitTop [is_error]

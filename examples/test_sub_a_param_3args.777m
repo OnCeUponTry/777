@@ -1,0 +1,15 @@
+# Sub-A test: F con 3 params + Call con 3 args.
+# add3 [a, b, c]: tmp = a + b + c, retorna.
+# Call add3 con 10, 20, 12. Exit con tmp = 42.
+D 0 0 zero Integer 0
+D 0 0 tmp Integer 0
+D 0 0 partial Integer 0
+
+F 0 0 add3 [a, b, c]
+R 0 0 Add [a, b] partial
+R 0 0 Add [partial, c] tmp
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [add3, 10, 20, 12]
+R 0 0 ExitTop [tmp]

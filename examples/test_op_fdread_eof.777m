@@ -1,0 +1,7 @@
+# Opcode FD_READ: stdin vacio retorna 0 bytes (EOF), exit 0
+D 0 0 fd Integer 0
+D 0 0 size Integer 16
+D 0 0 nbytes Integer 1
+R 0 0 Alloc [size] buf
+R 0 0 FdRead [fd, buf, nbytes] R
+R 0 0 ExitTop [R]

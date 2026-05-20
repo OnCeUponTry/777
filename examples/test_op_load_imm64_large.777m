@@ -1,0 +1,6 @@
+# Opcode LOAD_IMM64: valor > i32::MAX = 2147483647 fuerza imm64
+# 3_000_000_000 / 1_000_000_000 = 3
+D 0 0 N Integer 3000000000
+D 0 0 div_v Integer 1000000000
+R 0 0 Div [N, div_v] R
+R 0 0 ExitTop [R]

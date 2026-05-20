@@ -1,0 +1,16 @@
+# Fibonacci iterativo: F(10) = 55
+# a=0, b=1; for i in 0..n: t=a+b; a=b; b=t; tras n iters a=F(n)
+# Body: Add a b t (7) + Add b Z a (7) + Add t Z b (7) + Add i One i (7) + Eq i n done (7) + Jz (5) = 40
+D 0 0 a Integer 0
+D 0 0 b Integer 1
+D 0 0 n Integer 10
+D 0 0 i Integer 0
+D 0 0 One Integer 1
+D 0 0 Z Integer 0
+R 0 0 Add [a, b] t
+R 0 0 Add [b, Z] a
+R 0 0 Add [t, Z] b
+R 0 0 Add [i, One] i
+R 0 0 Eq [i, n] done
+R 0 0 Jz [done, -40]
+R 0 0 ExitTop [a]

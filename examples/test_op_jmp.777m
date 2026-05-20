@@ -1,0 +1,6 @@
+# Opcode JMP unconditional: salta sobre ExitTop[99], ejecuta ExitTop[42]
+D 0 0 R Integer 42
+D 0 0 N99 Integer 99
+R 0 0 Jmp [3]
+R 0 0 ExitTop [N99]
+R 0 0 ExitTop [R]

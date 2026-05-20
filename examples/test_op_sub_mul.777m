@@ -1,0 +1,7 @@
+# Opcodes SUB y MUL aislados: (10-7)*4 = 12
+D 0 0 A Integer 10
+D 0 0 B Integer 7
+D 0 0 C Integer 4
+R 0 0 Sub [A, B] D
+R 0 0 Mul [D, C] R
+R 0 0 ExitTop [R]

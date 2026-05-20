@@ -1,0 +1,16 @@
+# Sub-B: Call chain: square(6) usa Call mul(6,6) -> 36. Verifica Call dentro F.
+D 0 0 result Integer 0
+D 0 0 prod Integer 0
+
+F 0 0 mul [a, b]
+R 0 0 Mul [a, b] prod
+R 0 0 Ret [prod]
+R 0 0 EndF
+
+F 0 0 square [n]
+R 0 0 Call [mul, n, n] sq
+R 0 0 Ret [sq]
+R 0 0 EndF
+
+R 0 0 Call [square, 6] result
+R 0 0 ExitTop [result]

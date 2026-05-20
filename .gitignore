@@ -1,0 +1,23 @@
+# Compiled binaries (regenerable from source via build.sh + stage0-posix)
+*.elf
+!gen0_compilador_777.elf
+
+# Build artifacts
+*.M1
+*.hex2
+*.o
+*.bin
+
+# Temp / editor
+*.bak
+*.tmp
+*.swp
+.DS_Store
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Local test outputs
+/tmp_test/

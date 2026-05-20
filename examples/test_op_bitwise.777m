@@ -1,0 +1,10 @@
+# Opcodes BITAND/BITOR/BITXOR: combinacion
+# (0xFF AND 0x0F) OR (0x10 XOR 0x20) = 0x0F | 0x30 = 0x3F = 63
+D 0 0 A Integer 255
+D 0 0 B Integer 15
+D 0 0 C Integer 16
+D 0 0 D Integer 32
+R 0 0 BitAnd [A, B] X
+R 0 0 BitXor [C, D] Y
+R 0 0 BitOr [X, Y] R
+R 0 0 ExitTop [R]

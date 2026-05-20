@@ -1,0 +1,11 @@
+# Opcodes CALL + RET: callee resta 8, retorna. Exit final = 50 - 8 = 42
+# Layout bytecode:
+#   Decls (3*7=21B) | Call [rel] (3B) | ExitTop R (3B) | Sub R Eight R (7B) | Ret (1B)
+# Post-Call offset=24, Sub offset=27, rel=3
+D 0 0 R Integer 50
+D 0 0 Z Integer 0
+D 0 0 Eight Integer 8
+R 0 0 Call [3]
+R 0 0 ExitTop [R]
+R 0 0 Sub [R, Eight] R
+R 0 0 Ret []

@@ -1,0 +1,5 @@
+# Opcode ADD aislado: 7 + 35 = 42
+D 0 0 A Integer 7
+D 0 0 B Integer 35
+R 0 0 Add [A, B] R
+R 0 0 ExitTop [R]

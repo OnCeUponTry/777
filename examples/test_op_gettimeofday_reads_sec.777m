@@ -1,0 +1,11 @@
+# Sub-Lote3: GetTimeOfDay llena tv_sec en offset 0 (8 bytes).
+# Lee tv_sec via LoadI64. tv_sec actual debe ser > 1700000000 (post 2023-11).
+# Exit con 1 si tv_sec > 1700000000 (Gt), 0 si no (opcode roto o tiempo loco).
+D 0 0 zero Integer 0
+D 0 0 size Integer 16
+D 0 0 epoch_2023 Integer 1700000000
+R 0 0 Alloc [size] tv
+R 0 0 GetTimeOfDay [tv, zero] result
+R 0 0 LoadI64 [tv, zero] sec
+R 0 0 Gt [sec, epoch_2023] is_recent
+R 0 0 ExitTop [is_recent]

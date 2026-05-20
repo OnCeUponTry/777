@@ -1,0 +1,8 @@
+# Sub-E: Jmp forward a label, salta sobre instrucciones.
+# Exit 42 (no 99) si Jmp funciona.
+D 0 0 forty_two Integer 42
+D 0 0 N99 Integer 99
+R 0 0 Jmp [skip_99]
+R 0 0 ExitTop [N99]
+R 0 0 Label [skip_99]
+R 0 0 ExitTop [forty_two]

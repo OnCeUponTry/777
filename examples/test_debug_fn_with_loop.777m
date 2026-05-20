@@ -1,0 +1,16 @@
+# Debug: F con loop interno (Jz).
+# Funcion decrementa N desde 3 hasta 0, retorna.
+# stdin vacio. exit con N=0.
+D 0 0 N Integer 3
+D 0 0 Z Integer 0
+D 0 0 One Integer 1
+
+F 0 0 loop_decr []
+R 0 0 Sub [N, One] N
+R 0 0 Eq [N, Z] done
+R 0 0 Jz [done, -19]
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [loop_decr]
+R 0 0 ExitTop [N]

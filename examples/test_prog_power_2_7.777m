@@ -1,0 +1,13 @@
+# Power iterativo: 2^7 = 128
+# result=1, base=2, exp=7; while exp != 0: result *= base; exp--
+# Body: Mul result base result (7) + Sub exp One exp (7) + Eq exp Z done (7) + Jz (5) = 26
+D 0 0 result Integer 1
+D 0 0 base Integer 2
+D 0 0 exp Integer 7
+D 0 0 Z Integer 0
+D 0 0 One Integer 1
+R 0 0 Mul [result, base] result
+R 0 0 Sub [exp, One] exp
+R 0 0 Eq [exp, Z] done
+R 0 0 Jz [done, -26]
+R 0 0 ExitTop [result]

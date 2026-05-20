@@ -1,0 +1,13 @@
+# Contar digitos decimales: count(12345) = 5
+# while n != 0: n /= 10; count++
+# Body: Div n ten n (7) + Add count One count (7) + Eq n Z done (7) + Jz (5) = 26B
+D 0 0 n Integer 12345
+D 0 0 count Integer 0
+D 0 0 ten Integer 10
+D 0 0 Z Integer 0
+D 0 0 One Integer 1
+R 0 0 Div [n, ten] n
+R 0 0 Add [count, One] count
+R 0 0 Eq [n, Z] done
+R 0 0 Jz [done, -26]
+R 0 0 ExitTop [count]

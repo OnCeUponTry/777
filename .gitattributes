@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+*.c text
+*.h text
+*.sh text
+*.md text
+*.777m text
+*.txt text
+
+*.elf binary
+*.bin binary
+*.o binary

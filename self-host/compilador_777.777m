@@ -1,0 +1,3897 @@
+# ============================================================================
+# compilador_777.777m - port real de compilador_777.c a .777m source
+# ============================================================================
+# Lee source .777m por stdin, emite ELF ejecutable a stdout.
+# Equivalente functional de compilador_777.c (~2280 LOC C subset).
+#
+# Sub-decisiones aplicadas:
+#   Sub-A params F + Call args
+#   Sub-B Ret val + Call result + DROP
+#   Sub-C scope local cells dentro F (vars sin prefix son locales por F)
+#   Sub-E labels nombrados con fixup table
+#   Sub-G EndF cierre explicito F body (multi-Ret support)
+#
+# Estructura:
+#   F.1 m_const     - constantes + Alloc buffers globales
+#   F.2 m_str       - str_intern + str_eq + str_init + str_add_fixup
+#   F.3 m_sym       - sym_init + sym_eq + sym_lookup_global + sym_intern_global + sym_intern + is_valid_ident
+#   F.4 m_func      - func_init + func_lookup_or_create + func_add_fixup + func_resolve_fixups
+#   F.5 m_label     - label_init + label_lookup_or_create + label_add_fixup + label_resolve_fixups
+#   F.6 m_helpers   - sb + var_slot + parse_i64 + fits_in_i32 + bc_emit_*
+#   F.7 m_arch_x86  - arch_* handlers + emit setup/dispatch/tail
+#   F.8 m_elf       - build_vm_elf + elf_emit_*
+#   F.9 m_parser_h  - skip_to_eol + eq_str + emit_load_arg + opcode_from_kind + is_void_kind
+#   F.10 m_parser_r - compile_line_R (47 kinds)
+#   F.11 m_parser_d - compile_line_D + escapes Text
+#   F.12 m_parser_f - compile_line_F + params + auto-pop + EndF
+#   F.13 m_main     - compile_777m_to_bytecode + main
+# ============================================================================
+
+# ============================================================================
+# F.1 m_const - constantes y buffers globales
+# ============================================================================
+# Constantes capacidades del compilador (paralelo a #define del .c).
+
+# DEBUG B9: globals para instrumentar bytecode-level
+D 0 0 dbgfd Integer 2
+D 0 0 dbg1 Text "1"
+D 0 0 dbg2 Text "2"
+D 0 0 dbg3 Text "3"
+D 0 0 dbg4 Text "4"
+
+D 0 0 c_NUM_OPCODES         Integer 52
+D 0 0 c_HEADER_TOTAL        Integer 120
+D 0 0 c_DROP_SLOT           Integer 4095
+D 0 0 c_RET_ADDR_BASE       Integer 3000
+D 0 0 c_USER_SLOTS_MAX      Integer 3000
+D 0 0 c_N_VARS              Integer 4096
+D 0 0 c_VARS_AREA_SIZE      Integer 32768
+
+D 0 0 c_MAX_SOURCE          Integer 262144
+D 0 0 c_MAX_BYTECODE        Integer 131072
+D 0 0 c_MAX_ELF             Integer 262144
+
+D 0 0 c_MAX_STR_DATA        Integer 8192
+D 0 0 c_MAX_STRINGS         Integer 256
+D 0 0 c_MAX_FIXUPS          Integer 256
+D 0 0 c_STR_OFFSETS_BYTES   Integer 2048
+D 0 0 c_FIXUPS_BYTES        Integer 2048
+
+D 0 0 c_MAX_FUNCTIONS       Integer 128
+D 0 0 c_MAX_FUNCTION_FIXUPS Integer 1024
+D 0 0 c_MAX_FUNC_NAME_LEN   Integer 32
+D 0 0 c_FUNC_NAMES_BYTES    Integer 4096
+D 0 0 c_MAX_PARAMS_PER_FN   Integer 8
+D 0 0 c_FUNC_PARAMS_BYTES   Integer 8192
+D 0 0 c_FUNCTION_OFFSETS_BYTES Integer 1024
+D 0 0 c_FUNCTION_FIXUPS_BYTES Integer 8192
+
+D 0 0 c_MAX_LABELS          Integer 512
+D 0 0 c_MAX_LABEL_FIXUPS    Integer 1024
+D 0 0 c_MAX_LABEL_NAME_LEN  Integer 32
+D 0 0 c_LABEL_NAMES_BYTES   Integer 16384
+D 0 0 c_LABEL_OFFSETS_BYTES Integer 4096
+D 0 0 c_LABEL_FIXUPS_BYTES  Integer 8192
+
+D 0 0 c_MAX_NAME_LEN        Integer 32
+D 0 0 c_SYM_BUF_SIZE        Integer 131072
+
+D 0 0 c_FD_STDIN            Integer 0
+D 0 0 c_FD_STDOUT           Integer 1
+D 0 0 c_FD_STDERR           Integer 2
+D 0 0 c_NEG_ONE             Integer -1
+D 0 0 c_BYTE_MASK           Integer 255
+
+# Allocs buffers globales (top-level => slots globales accesibles desde F).
+R 0 0 Alloc [c_MAX_SOURCE]       g_source
+R 0 0 Alloc [c_MAX_BYTECODE]     g_bytecode
+R 0 0 Alloc [c_MAX_ELF]          g_elf
+
+D 0 0 g_source_len    Integer 0
+D 0 0 g_bytecode_len  Integer 0
+D 0 0 g_elf_len       Integer 0
+
+# String table buffers
+R 0 0 Alloc [c_MAX_STR_DATA]     str_data
+R 0 0 Alloc [c_MAX_STR_DATA]     str_tmp
+R 0 0 Alloc [c_STR_OFFSETS_BYTES] str_offsets
+R 0 0 Alloc [c_STR_OFFSETS_BYTES] str_lens
+R 0 0 Alloc [c_FIXUPS_BYTES]     fixup_bc
+R 0 0 Alloc [c_FIXUPS_BYTES]     fixup_data
+D 0 0 str_data_len   Integer 0
+D 0 0 str_count      Integer 0
+D 0 0 fixup_count    Integer 0
+
+# Symbol table buffers
+R 0 0 Alloc [c_SYM_BUF_SIZE]     sym_names
+D 0 0 sym_count      Integer 0
+# Sub-C reciclaje slots: sym_high_water = max sym_count alcanzado.
+# Nuevos slots siempre >= sym_high_water (no colision con slots usados por F previos).
+D 0 0 sym_high_water Integer 26
+# Snapshot sym_count al entrar F. Al salir F: sym_count = fn_slot_alloc_start (libera locales).
+D 0 0 fn_slot_alloc_start Integer 0
+
+# Functions table buffers
+R 0 0 Alloc [c_FUNC_NAMES_BYTES]      function_names
+R 0 0 Alloc [c_FUNCTION_OFFSETS_BYTES] function_offsets
+R 0 0 Alloc [c_FUNCTION_OFFSETS_BYTES] function_param_count
+R 0 0 Alloc [c_FUNC_PARAMS_BYTES]     function_params
+R 0 0 Alloc [c_FUNCTION_FIXUPS_BYTES] function_fixup_bc
+R 0 0 Alloc [c_FUNCTION_FIXUPS_BYTES] function_fixup_target
+D 0 0 function_count       Integer 0
+D 0 0 function_fixup_count Integer 0
+D 0 0 pending_fn_jmp_pos   Integer -1
+D 0 0 pending_fn_slot      Integer -1
+
+# Labels table buffers
+R 0 0 Alloc [c_LABEL_NAMES_BYTES]   label_names
+R 0 0 Alloc [c_LABEL_OFFSETS_BYTES] label_offsets
+R 0 0 Alloc [c_LABEL_FIXUPS_BYTES]  label_fixup_bc
+R 0 0 Alloc [c_LABEL_FIXUPS_BYTES]  label_fixup_target
+D 0 0 label_count       Integer 0
+D 0 0 label_fixup_count Integer 0
+
+# ============================================================================
+# F.2 m_str - string interning + fixups (paralelo a compilador_777.c 204-269)
+# ============================================================================
+
+# void str_init() { str_data_len=0; str_count=0; fixup_count=0;
+#                   zero out str_data[MAX_STR_DATA]; }
+F 0 0 str_init []
+R 0 0 Add [0, 0] str_data_len
+R 0 0 Add [0, 0] str_count
+R 0 0 Add [0, 0] fixup_count
+R 0 0 Add [0, 0] i
+R 0 0 Label [zo_loop]
+R 0 0 Lt [i, c_MAX_STR_DATA] cond
+R 0 0 Jz [cond, zo_done]
+R 0 0 StoreByte [str_data, i, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [zo_loop]
+R 0 0 Label [zo_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# int str_eq(int off, int len, char* content, int content_len)
+#   { si len!=clen return 0; for i in 0..len: if str_data[off+i]!=content[i] return 0; return 1; }
+F 0 0 str_eq [off, len, content, content_len]
+R 0 0 Eq [len, content_len] cond
+R 0 0 Jz [cond, ne_neq]
+R 0 0 Add [0, 0] i
+R 0 0 Label [ne_loop]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, ne_done]
+R 0 0 Add [off, i] addr_a
+R 0 0 LoadByte [str_data, addr_a] b_a
+R 0 0 LoadByte [content, i] b_b
+R 0 0 Eq [b_a, b_b] cond
+R 0 0 Jz [cond, ne_neq]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [ne_loop]
+R 0 0 Label [ne_done]
+R 0 0 Ret [1]
+R 0 0 Label [ne_neq]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# int str_intern(char* content, int content_len)
+#   { busca; si match return offset; sino append y retorna nuevo offset; -1 si full }
+F 0 0 str_intern [content, content_len]
+R 0 0 Add [0, 0] i
+R 0 0 Label [in_lookup]
+R 0 0 Lt [i, str_count] cond
+R 0 0 Jz [cond, in_no_match]
+R 0 0 Mul [i, 8] idx_off
+R 0 0 LoadI64 [str_offsets, idx_off] eoff
+R 0 0 LoadI64 [str_lens, idx_off] elen
+R 0 0 Call [str_eq, eoff, elen, content, content_len] eqr
+R 0 0 Jz [eqr, in_next]
+R 0 0 Ret [eoff]
+R 0 0 Label [in_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [in_lookup]
+R 0 0 Label [in_no_match]
+R 0 0 Lt [str_count, c_MAX_STRINGS] cond
+R 0 0 Jz [cond, in_full]
+R 0 0 Add [str_data_len, content_len] would_be
+R 0 0 Gt [would_be, c_MAX_STR_DATA] over
+R 0 0 Jz [over, in_cap_ok]
+R 0 0 Label [in_full]
+R 0 0 Ret [-1]
+R 0 0 Label [in_cap_ok]
+R 0 0 Add [str_data_len, 0] new_off
+R 0 0 Add [0, 0] i
+R 0 0 Label [in_copy]
+R 0 0 Lt [i, content_len] cond
+R 0 0 Jz [cond, in_cdone]
+R 0 0 Add [new_off, i] dst_off
+R 0 0 LoadByte [content, i] b
+R 0 0 StoreByte [str_data, dst_off, b]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [in_copy]
+R 0 0 Label [in_cdone]
+R 0 0 Add [str_data_len, content_len] str_data_len
+R 0 0 Mul [str_count, 8] slot_off
+R 0 0 StoreI64 [str_offsets, slot_off, new_off]
+R 0 0 StoreI64 [str_lens, slot_off, content_len]
+R 0 0 Add [str_count, 1] str_count
+R 0 0 Ret [new_off]
+R 0 0 EndF
+
+# int str_add_fixup(int bc_pos, int data_off)
+#   { si fixup_count >= MAX return 1; append; return 0 }
+F 0 0 str_add_fixup [bc_pos, data_off]
+R 0 0 Lt [fixup_count, c_MAX_FIXUPS] cond
+R 0 0 Jz [cond, af_full]
+R 0 0 Mul [fixup_count, 8] slot_off
+R 0 0 StoreI64 [fixup_bc, slot_off, bc_pos]
+R 0 0 StoreI64 [fixup_data, slot_off, data_off]
+R 0 0 Add [fixup_count, 1] fixup_count
+R 0 0 Ret [0]
+R 0 0 Label [af_full]
+R 0 0 Ret [1]
+R 0 0 EndF
+
+# ============================================================================
+# F.3 m_sym - symbol table (paralelo a compilador_777.c 494-592)
+# ============================================================================
+# Layout: sym_names[slot * MAX_NAME_LEN] = nombre, terminado en 0.
+# Slots 0-25 prepoblados con 'A'..'Z'. sym_count=26 inicial.
+
+# void sym_init() { zero out sym_names; prepuebla A-Z; sym_count=26 }
+F 0 0 sym_init []
+R 0 0 Add [0, 0] i
+R 0 0 Label [si_zero]
+R 0 0 Lt [i, c_SYM_BUF_SIZE] cond
+R 0 0 Jz [cond, si_zdone]
+R 0 0 StoreByte [sym_names, i, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [si_zero]
+R 0 0 Label [si_zdone]
+R 0 0 Add [0, 0] i
+R 0 0 Label [si_az]
+R 0 0 Lt [i, 26] cond
+R 0 0 Jz [cond, si_done]
+R 0 0 Mul [i, c_MAX_NAME_LEN] base
+R 0 0 Add [65, i] ch
+R 0 0 StoreByte [sym_names, base, ch]
+R 0 0 Add [base, 1] base1
+R 0 0 StoreByte [sym_names, base1, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [si_az]
+R 0 0 Label [si_done]
+R 0 0 Add [26, 0] sym_count
+R 0 0 Add [26, 0] sym_high_water
+R 0 0 Ret []
+R 0 0 EndF
+
+# int sym_eq(int slot, char* name, int len)
+#   { compara sym_names[slot*32 .. slot*32+len] con name[0..len] + terminator 0 }
+F 0 0 sym_eq [slot, name, len]
+R 0 0 Mul [slot, c_MAX_NAME_LEN] base
+R 0 0 Add [0, 0] i
+R 0 0 Label [se_loop]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, se_post]
+R 0 0 Add [base, i] off_a
+R 0 0 LoadByte [sym_names, off_a] b_a
+R 0 0 LoadByte [name, i] b_b
+R 0 0 Eq [b_a, b_b] cond
+R 0 0 Jz [cond, se_neq]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [se_loop]
+R 0 0 Label [se_post]
+R 0 0 Add [base, len] term_off
+R 0 0 LoadByte [sym_names, term_off] b_t
+R 0 0 Eq [b_t, 0] cond
+R 0 0 Jz [cond, se_neq]
+R 0 0 Ret [1]
+R 0 0 Label [se_neq]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# int sym_lookup_global(char* name, int len) -> slot o -1
+F 0 0 sym_lookup_global [name, len]
+R 0 0 Lt [0, len] valid
+R 0 0 Jz [valid, sl_invalid]
+R 0 0 Sub [c_MAX_NAME_LEN, 1] max_allowed
+R 0 0 Gt [len, max_allowed] too_long
+R 0 0 Jz [too_long, sl_lenok]
+R 0 0 Ret [-1]
+R 0 0 Label [sl_lenok]
+R 0 0 Add [0, 0] slot
+R 0 0 Label [sl_loop]
+R 0 0 Lt [slot, sym_count] cond
+R 0 0 Jz [cond, sl_notfound]
+R 0 0 Call [sym_eq, slot, name, len] eqr
+R 0 0 Jz [eqr, sl_next]
+R 0 0 Ret [slot]
+R 0 0 Label [sl_next]
+R 0 0 Add [slot, 1] slot
+R 0 0 Jmp [sl_loop]
+R 0 0 Label [sl_notfound]
+R 0 0 Ret [-1]
+R 0 0 Label [sl_invalid]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+# int sym_intern_global(char* name, int len) -> slot (crea si no existe)
+# Sub-C reciclaje: nuevo slot = max(sym_count, sym_high_water). Eso protege
+# slots ya emitidos por F's previos cuya sym_count fue reseteada al cerrar F.
+F 0 0 sym_intern_global [name, len]
+R 0 0 Call [sym_lookup_global, name, len] existing
+R 0 0 Lt [existing, 0] not_found
+R 0 0 Jz [not_found, sig_return]
+R 0 0 Lt [sym_count, sym_high_water] use_hw
+R 0 0 Jz [use_hw, sig_use_count]
+R 0 0 Add [sym_high_water, 0] slot
+R 0 0 Jmp [sig_check_cap]
+R 0 0 Label [sig_use_count]
+R 0 0 Add [sym_count, 0] slot
+R 0 0 Label [sig_check_cap]
+R 0 0 Lt [slot, c_USER_SLOTS_MAX] cap_ok
+R 0 0 Jz [cap_ok, sig_full]
+R 0 0 Mul [slot, c_MAX_NAME_LEN] base
+R 0 0 Add [0, 0] i
+R 0 0 Label [sig_copy]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, sig_cdone]
+R 0 0 Add [base, i] dst
+R 0 0 LoadByte [name, i] b
+R 0 0 StoreByte [sym_names, dst, b]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [sig_copy]
+R 0 0 Label [sig_cdone]
+R 0 0 Add [base, len] term
+R 0 0 StoreByte [sym_names, term, 0]
+R 0 0 Add [slot, 1] sym_count
+R 0 0 Gt [sym_count, sym_high_water] grew
+R 0 0 Jz [grew, sig_no_hw]
+R 0 0 Add [sym_count, 0] sym_high_water
+R 0 0 Label [sig_no_hw]
+R 0 0 Ret [slot]
+R 0 0 Label [sig_return]
+R 0 0 Ret [existing]
+R 0 0 Label [sig_full]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+# Buffer temp para prefijar nombres locales Sub-C: [HI, LO, '|', ...name].
+R 0 0 Alloc [c_MAX_NAME_LEN] sym_prefixed_buf
+
+# int sym_intern(char* name, int len) -> slot
+# Sub-decision C: dentro F (pending_fn_slot >= 0):
+#   - __name: skip __, intern en global directo.
+#   - lookup global existente: si existe (vars top-level), retorna.
+#   - sino: intern prefijado [HI,LO,'|',name] -> slot local.
+# Fuera F: intern global normal.
+F 0 0 sym_intern [name, len]
+R 0 0 Lt [0, len] valid
+R 0 0 Jz [valid, si_inv]
+R 0 0 Sub [c_MAX_NAME_LEN, 1] max_allowed
+R 0 0 Gt [len, max_allowed] too_long
+R 0 0 Jz [too_long, si_lenok]
+R 0 0 Ret [-1]
+R 0 0 Label [si_lenok]
+R 0 0 Lt [pending_fn_slot, 0] outside
+R 0 0 Jz [outside, si_inside]
+R 0 0 Call [sym_intern_global, name, len] r1
+R 0 0 Ret [r1]
+R 0 0 Label [si_inside]
+R 0 0 Gt [len, 2] longer
+R 0 0 Jz [longer, si_try_global]
+R 0 0 LoadByte [name, 0] b0
+R 0 0 Eq [b0, 95] is_u0
+R 0 0 Jz [is_u0, si_try_global]
+R 0 0 LoadByte [name, 1] b1
+R 0 0 Eq [b1, 95] is_u1
+R 0 0 Jz [is_u1, si_try_global]
+R 0 0 Add [name, 2] adj_name
+R 0 0 Sub [len, 2] adj_len
+R 0 0 Call [sym_intern_global, adj_name, adj_len] r2
+R 0 0 Ret [r2]
+R 0 0 Label [si_try_global]
+R 0 0 Call [sym_lookup_global, name, len] eg
+R 0 0 Lt [eg, 0] not_global
+R 0 0 Jz [not_global, si_use_global]
+R 0 0 StoreByte [sym_prefixed_buf, 0, pending_fn_slot]
+R 0 0 Shr [pending_fn_slot, 8] hi
+R 0 0 StoreByte [sym_prefixed_buf, 1, hi]
+R 0 0 StoreByte [sym_prefixed_buf, 2, 124]
+R 0 0 Add [0, 0] i
+R 0 0 Label [si_pfx]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, si_pdone]
+R 0 0 LoadByte [name, i] b
+R 0 0 Add [3, i] pdst
+R 0 0 StoreByte [sym_prefixed_buf, pdst, b]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [si_pfx]
+R 0 0 Label [si_pdone]
+R 0 0 Add [3, len] plen
+R 0 0 Sub [c_MAX_NAME_LEN, 1] max_p
+R 0 0 Gt [plen, max_p] over
+R 0 0 Jz [over, si_pcall]
+R 0 0 Ret [-1]
+R 0 0 Label [si_pcall]
+R 0 0 Call [sym_intern_global, sym_prefixed_buf, plen] r3
+R 0 0 Ret [r3]
+R 0 0 Label [si_use_global]
+R 0 0 Ret [eg]
+R 0 0 Label [si_inv]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+# ============================================================================
+# F.4 m_func - functions table + fixups (paralelo a compilador_777.c 273-382)
+# ============================================================================
+# Layout:
+#   function_names[slot * MAX_FUNC_NAME_LEN] = name terminado en 0.
+#   function_offsets[slot] = i64 offset bytecode (o -1 si no definido aun).
+#   function_param_count[slot] = i64 count.
+#   function_params[slot * MAX_PARAMS_PER_FN + i] = i64 sym slot del param i.
+
+# void func_init()
+F 0 0 func_init []
+R 0 0 Add [0, 0] i
+R 0 0 Label [fi_zname]
+R 0 0 Lt [i, c_FUNC_NAMES_BYTES] cond
+R 0 0 Jz [cond, fi_zndone]
+R 0 0 StoreByte [function_names, i, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [fi_zname]
+R 0 0 Label [fi_zndone]
+R 0 0 Add [0, 0] i
+R 0 0 Label [fi_zoff]
+R 0 0 Lt [i, c_MAX_FUNCTIONS] cond
+R 0 0 Jz [cond, fi_zodone]
+R 0 0 Mul [i, 8] off
+R 0 0 StoreI64 [function_offsets, off, -1]
+R 0 0 StoreI64 [function_param_count, off, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [fi_zoff]
+R 0 0 Label [fi_zodone]
+R 0 0 Add [0, 0] i
+R 0 0 Label [fi_zpar]
+R 0 0 Lt [i, c_FUNC_PARAMS_BYTES] cond
+R 0 0 Jz [cond, fi_zpdone]
+R 0 0 StoreByte [function_params, i, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [fi_zpar]
+R 0 0 Label [fi_zpdone]
+R 0 0 Add [0, 0] function_count
+R 0 0 Add [0, 0] function_fixup_count
+R 0 0 Add [-1, 0] pending_fn_jmp_pos
+R 0 0 Add [-1, 0] pending_fn_slot
+R 0 0 Ret []
+R 0 0 EndF
+
+# int func_name_eq(int slot, char* name, int len) -> 1 si igual
+F 0 0 func_name_eq [slot, name, len]
+R 0 0 Mul [slot, c_MAX_FUNC_NAME_LEN] base
+R 0 0 Add [0, 0] i
+R 0 0 Label [fne_loop]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, fne_post]
+R 0 0 Add [base, i] off_a
+R 0 0 LoadByte [function_names, off_a] b_a
+R 0 0 LoadByte [name, i] b_b
+R 0 0 Eq [b_a, b_b] cond
+R 0 0 Jz [cond, fne_neq]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [fne_loop]
+R 0 0 Label [fne_post]
+R 0 0 Add [base, len] term_off
+R 0 0 LoadByte [function_names, term_off] b_t
+R 0 0 Eq [b_t, 0] cond
+R 0 0 Jz [cond, fne_neq]
+R 0 0 Ret [1]
+R 0 0 Label [fne_neq]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# int func_lookup_or_create(char* name, int len) -> slot o -1
+F 0 0 func_lookup_or_create [name, len]
+R 0 0 Lt [0, len] valid
+R 0 0 Jz [valid, flc_inv]
+R 0 0 Sub [c_MAX_FUNC_NAME_LEN, 1] max_allowed
+R 0 0 Gt [len, max_allowed] too_long
+R 0 0 Jz [too_long, flc_lenok]
+R 0 0 Ret [-1]
+R 0 0 Label [flc_lenok]
+R 0 0 Add [0, 0] slot
+R 0 0 Label [flc_loop]
+R 0 0 Lt [slot, function_count] cond
+R 0 0 Jz [cond, flc_create]
+R 0 0 Call [func_name_eq, slot, name, len] eqr
+R 0 0 Jz [eqr, flc_next]
+R 0 0 Ret [slot]
+R 0 0 Label [flc_next]
+R 0 0 Add [slot, 1] slot
+R 0 0 Jmp [flc_loop]
+R 0 0 Label [flc_create]
+R 0 0 Lt [function_count, c_MAX_FUNCTIONS] cap
+R 0 0 Jz [cap, flc_full]
+R 0 0 Add [function_count, 0] slot
+R 0 0 Mul [slot, c_MAX_FUNC_NAME_LEN] base
+R 0 0 Add [0, 0] i
+R 0 0 Label [flc_copy]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, flc_cdone]
+R 0 0 Add [base, i] dst
+R 0 0 LoadByte [name, i] b
+R 0 0 StoreByte [function_names, dst, b]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [flc_copy]
+R 0 0 Label [flc_cdone]
+R 0 0 Add [base, len] term
+R 0 0 StoreByte [function_names, term, 0]
+R 0 0 Mul [slot, 8] off_i64
+R 0 0 StoreI64 [function_offsets, off_i64, -1]
+R 0 0 Add [function_count, 1] function_count
+R 0 0 Ret [slot]
+R 0 0 Label [flc_full]
+R 0 0 Ret [-1]
+R 0 0 Label [flc_inv]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+# int func_add_fixup(int bc_pos, int target_slot) -> 0 OK / 1 full
+F 0 0 func_add_fixup [bc_pos, target_slot]
+R 0 0 Lt [function_fixup_count, c_MAX_FUNCTION_FIXUPS] cond
+R 0 0 Jz [cond, fafu_full]
+R 0 0 Mul [function_fixup_count, 8] off
+R 0 0 StoreI64 [function_fixup_bc, off, bc_pos]
+R 0 0 StoreI64 [function_fixup_target, off, target_slot]
+R 0 0 Add [function_fixup_count, 1] function_fixup_count
+R 0 0 Ret [0]
+R 0 0 Label [fafu_full]
+R 0 0 Ret [1]
+R 0 0 EndF
+
+# void func_resolve_fixups()
+F 0 0 func_resolve_fixups []
+R 0 0 Add [0, 0] i
+R 0 0 Label [frf_loop]
+R 0 0 Lt [i, function_fixup_count] cond
+R 0 0 Jz [cond, frf_done]
+R 0 0 Mul [i, 8] off
+R 0 0 LoadI64 [function_fixup_target, off] slot
+R 0 0 LoadI64 [function_fixup_bc, off] fixup_bc_pos
+R 0 0 Mul [slot, 8] soff
+R 0 0 LoadI64 [function_offsets, soff] target_off
+R 0 0 Lt [target_off, 0] undef
+R 0 0 Jz [undef, frf_patch]
+R 0 0 Jmp [frf_next]
+R 0 0 Label [frf_patch]
+R 0 0 Add [fixup_bc_pos, 2] call_post
+R 0 0 Sub [target_off, call_post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 StoreByte [g_bytecode, fixup_bc_pos, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 BitAnd [rs, 255] rb1
+R 0 0 Add [fixup_bc_pos, 1] pos1
+R 0 0 StoreByte [g_bytecode, pos1, rb1]
+R 0 0 Label [frf_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [frf_loop]
+R 0 0 Label [frf_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# ============================================================================
+# F.5 m_label - labels table + fixups (paralelo a compilador_777.c 386-481)
+# ============================================================================
+
+F 0 0 label_init []
+R 0 0 Add [0, 0] i
+R 0 0 Label [li_zname]
+R 0 0 Lt [i, c_LABEL_NAMES_BYTES] cond
+R 0 0 Jz [cond, li_zndone]
+R 0 0 StoreByte [label_names, i, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [li_zname]
+R 0 0 Label [li_zndone]
+R 0 0 Add [0, 0] i
+R 0 0 Label [li_zoff]
+R 0 0 Lt [i, c_MAX_LABELS] cond
+R 0 0 Jz [cond, li_zodone]
+R 0 0 Mul [i, 8] off
+R 0 0 StoreI64 [label_offsets, off, -1]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [li_zoff]
+R 0 0 Label [li_zodone]
+R 0 0 Add [0, 0] label_count
+R 0 0 Add [0, 0] label_fixup_count
+R 0 0 Ret []
+R 0 0 EndF
+
+F 0 0 label_name_eq [slot, name, len]
+R 0 0 Mul [slot, c_MAX_LABEL_NAME_LEN] base
+R 0 0 Add [0, 0] i
+R 0 0 Label [lne_loop]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, lne_post]
+R 0 0 Add [base, i] off_a
+R 0 0 LoadByte [label_names, off_a] b_a
+R 0 0 LoadByte [name, i] b_b
+R 0 0 Eq [b_a, b_b] cond
+R 0 0 Jz [cond, lne_neq]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [lne_loop]
+R 0 0 Label [lne_post]
+R 0 0 Add [base, len] term_off
+R 0 0 LoadByte [label_names, term_off] b_t
+R 0 0 Eq [b_t, 0] cond
+R 0 0 Jz [cond, lne_neq]
+R 0 0 Ret [1]
+R 0 0 Label [lne_neq]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+F 0 0 label_lookup_or_create [name, len]
+R 0 0 Lt [0, len] valid
+R 0 0 Jz [valid, llc_inv]
+R 0 0 Sub [c_MAX_LABEL_NAME_LEN, 1] max_allowed
+R 0 0 Gt [len, max_allowed] too_long
+R 0 0 Jz [too_long, llc_lenok]
+R 0 0 Ret [-1]
+R 0 0 Label [llc_lenok]
+R 0 0 Add [0, 0] slot
+R 0 0 Label [llc_loop]
+R 0 0 Lt [slot, label_count] cond
+R 0 0 Jz [cond, llc_create]
+R 0 0 Call [label_name_eq, slot, name, len] eqr
+R 0 0 Jz [eqr, llc_next]
+R 0 0 Ret [slot]
+R 0 0 Label [llc_next]
+R 0 0 Add [slot, 1] slot
+R 0 0 Jmp [llc_loop]
+R 0 0 Label [llc_create]
+R 0 0 Lt [label_count, c_MAX_LABELS] cap
+R 0 0 Jz [cap, llc_full]
+R 0 0 Add [label_count, 0] slot
+R 0 0 Mul [slot, c_MAX_LABEL_NAME_LEN] base
+R 0 0 Add [0, 0] i
+R 0 0 Label [llc_copy]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, llc_cdone]
+R 0 0 Add [base, i] dst
+R 0 0 LoadByte [name, i] b
+R 0 0 StoreByte [label_names, dst, b]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [llc_copy]
+R 0 0 Label [llc_cdone]
+R 0 0 Add [base, len] term
+R 0 0 StoreByte [label_names, term, 0]
+R 0 0 Mul [slot, 8] off_i64
+R 0 0 StoreI64 [label_offsets, off_i64, -1]
+R 0 0 Add [label_count, 1] label_count
+R 0 0 Ret [slot]
+R 0 0 Label [llc_full]
+R 0 0 Ret [-1]
+R 0 0 Label [llc_inv]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+F 0 0 label_add_fixup [bc_pos, target_slot]
+R 0 0 Lt [label_fixup_count, c_MAX_LABEL_FIXUPS] cond
+R 0 0 Jz [cond, laf_full]
+R 0 0 Mul [label_fixup_count, 8] off
+R 0 0 StoreI64 [label_fixup_bc, off, bc_pos]
+R 0 0 StoreI64 [label_fixup_target, off, target_slot]
+R 0 0 Add [label_fixup_count, 1] label_fixup_count
+R 0 0 Ret [0]
+R 0 0 Label [laf_full]
+R 0 0 Ret [1]
+R 0 0 EndF
+
+F 0 0 label_resolve_fixups []
+R 0 0 Add [0, 0] i
+R 0 0 Label [lrf_loop]
+R 0 0 Lt [i, label_fixup_count] cond
+R 0 0 Jz [cond, lrf_done]
+R 0 0 Mul [i, 8] off
+R 0 0 LoadI64 [label_fixup_target, off] slot
+R 0 0 LoadI64 [label_fixup_bc, off] fixup_bc_pos
+R 0 0 Mul [slot, 8] soff
+R 0 0 LoadI64 [label_offsets, soff] target_off
+R 0 0 Lt [target_off, 0] undef
+R 0 0 Jz [undef, lrf_patch]
+R 0 0 Jmp [lrf_next]
+R 0 0 Label [lrf_patch]
+R 0 0 Add [fixup_bc_pos, 2] post
+R 0 0 Sub [target_off, post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 StoreByte [g_bytecode, fixup_bc_pos, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 BitAnd [rs, 255] rb1
+R 0 0 Add [fixup_bc_pos, 1] pos1
+R 0 0 StoreByte [g_bytecode, pos1, rb1]
+R 0 0 Label [lrf_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [lrf_loop]
+R 0 0 Label [lrf_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# int is_valid_ident(char* name, int len) -> 1 si valido
+# [A-Za-z_][A-Za-z0-9_]{0,MAX_NAME_LEN-1}
+# Lógica: primer char debe ser '_' o A-Z o a-z. Subsiguientes pueden incluir 0-9.
+F 0 0 is_valid_ident [name, len]
+R 0 0 Lt [0, len] valid
+R 0 0 Jz [valid, iv_no]
+R 0 0 Sub [c_MAX_NAME_LEN, 1] max_allowed
+R 0 0 Gt [len, max_allowed] too_long
+R 0 0 Jz [too_long, iv_lenok]
+R 0 0 Jmp [iv_no]
+R 0 0 Label [iv_lenok]
+# Check primer char: '_' o A-Z o a-z
+R 0 0 LoadByte [name, 0] c
+R 0 0 Eq [c, 95] ok
+R 0 0 Jz [ok, iv1_chk_upper]
+R 0 0 Jmp [iv_first_ok]
+R 0 0 Label [iv1_chk_upper]
+R 0 0 Lt [c, 65] below_A
+R 0 0 Jz [below_A, iv1_in_upper_range]
+R 0 0 Jmp [iv1_chk_lower]
+R 0 0 Label [iv1_in_upper_range]
+R 0 0 Gt [c, 90] above_Z
+R 0 0 Jz [above_Z, iv_first_ok]
+R 0 0 Label [iv1_chk_lower]
+R 0 0 Lt [c, 97] below_a
+R 0 0 Jz [below_a, iv1_in_lower_range]
+R 0 0 Jmp [iv_no]
+R 0 0 Label [iv1_in_lower_range]
+R 0 0 Gt [c, 122] above_z
+R 0 0 Jz [above_z, iv_first_ok]
+R 0 0 Jmp [iv_no]
+R 0 0 Label [iv_first_ok]
+# Loop chars subsiguientes
+R 0 0 Add [1, 0] i
+R 0 0 Label [iv_loop]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, iv_yes]
+R 0 0 LoadByte [name, i] c
+R 0 0 Eq [c, 95] ok
+R 0 0 Jz [ok, iv2_chk_digit]
+R 0 0 Jmp [iv_next]
+R 0 0 Label [iv2_chk_digit]
+R 0 0 Lt [c, 48] below_0
+R 0 0 Jz [below_0, iv2_in_digit]
+R 0 0 Jmp [iv2_chk_upper]
+R 0 0 Label [iv2_in_digit]
+R 0 0 Gt [c, 57] above_9
+R 0 0 Jz [above_9, iv_next]
+R 0 0 Label [iv2_chk_upper]
+R 0 0 Lt [c, 65] below_A2
+R 0 0 Jz [below_A2, iv2_in_upper]
+R 0 0 Jmp [iv2_chk_lower]
+R 0 0 Label [iv2_in_upper]
+R 0 0 Gt [c, 90] above_Z2
+R 0 0 Jz [above_Z2, iv_next]
+R 0 0 Label [iv2_chk_lower]
+R 0 0 Lt [c, 97] below_a2
+R 0 0 Jz [below_a2, iv2_in_lower]
+R 0 0 Jmp [iv_no]
+R 0 0 Label [iv2_in_lower]
+R 0 0 Gt [c, 122] above_z2
+R 0 0 Jz [above_z2, iv_next]
+R 0 0 Jmp [iv_no]
+R 0 0 Label [iv_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [iv_loop]
+R 0 0 Label [iv_yes]
+R 0 0 Ret [1]
+R 0 0 Label [iv_no]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# ============================================================================
+# F.6 m_helpers - sb + var_slot + parse_i64 + fits_in_i32 + bc_emit_* + elf_emit_*
+# ============================================================================
+
+# Global flag de error para parse_i64 (paralelo a int* err_out de C).
+D 0 0 g_parse_err Integer 0
+
+# int sb(int p) = g_source[p] zero-extended
+F 0 0 sb [p]
+R 0 0 LoadByte [g_source, p] b
+R 0 0 Ret [b]
+R 0 0 EndF
+
+# int var_slot(int c) -> c-'A' si A-Z, sino -1
+F 0 0 var_slot [c]
+R 0 0 Lt [c, 65] below
+R 0 0 Jz [below, vs_chk_upper]
+R 0 0 Jmp [vs_neg]
+R 0 0 Label [vs_chk_upper]
+R 0 0 Gt [c, 90] above
+R 0 0 Jz [above, vs_ok]
+R 0 0 Jmp [vs_neg]
+R 0 0 Label [vs_ok]
+R 0 0 Sub [c, 65] slot
+R 0 0 Ret [slot]
+R 0 0 Label [vs_neg]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+# int parse_i64(char* s, int len) -> val. Setea g_parse_err=0 si OK, 1 si error.
+F 0 0 parse_i64 [s, len]
+R 0 0 Add [0, 0] g_parse_err
+R 0 0 Eq [len, 0] empty
+R 0 0 Jz [empty, pi_lenok]
+R 0 0 Add [1, 0] g_parse_err
+R 0 0 Ret [0]
+R 0 0 Label [pi_lenok]
+R 0 0 Add [0, 0] neg
+R 0 0 Add [0, 0] i
+R 0 0 LoadByte [s, 0] b0
+R 0 0 Eq [b0, 45] is_neg
+R 0 0 Jz [is_neg, pi_parse]
+R 0 0 Add [1, 0] neg
+R 0 0 Add [1, 0] i
+R 0 0 Eq [len, 1] only_minus
+R 0 0 Jz [only_minus, pi_parse]
+R 0 0 Add [1, 0] g_parse_err
+R 0 0 Ret [0]
+R 0 0 Label [pi_parse]
+R 0 0 Add [0, 0] acc
+R 0 0 Label [pi_loop]
+R 0 0 Lt [i, len] cond
+R 0 0 Jz [cond, pi_done]
+R 0 0 LoadByte [s, i] b
+R 0 0 Lt [b, 48] bad_low
+R 0 0 Jz [bad_low, pi_chk_high]
+R 0 0 Jmp [pi_err]
+R 0 0 Label [pi_chk_high]
+R 0 0 Gt [b, 57] bad_high
+R 0 0 Jz [bad_high, pi_acc]
+R 0 0 Jmp [pi_err]
+R 0 0 Label [pi_acc]
+R 0 0 Mul [acc, 10] acc10
+R 0 0 Sub [b, 48] dig
+R 0 0 Add [acc10, dig] acc
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [pi_loop]
+R 0 0 Label [pi_done]
+R 0 0 Eq [neg, 1] is_n
+R 0 0 Jz [is_n, pi_pos]
+R 0 0 Sub [0, acc] negval
+R 0 0 Ret [negval]
+R 0 0 Label [pi_pos]
+R 0 0 Ret [acc]
+R 0 0 Label [pi_err]
+R 0 0 Add [1, 0] g_parse_err
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# int fits_in_i32(int v) -> 1 si -2^31 <= v <= 2^31 - 1
+D 0 0 c_INT32_MIN Integer -2147483648
+D 0 0 c_INT32_MAX Integer 2147483647
+F 0 0 fits_in_i32 [v]
+R 0 0 Lt [v, 0] is_neg
+R 0 0 Jz [is_neg, fi_pos_path]
+R 0 0 Lt [v, c_INT32_MIN] below_min
+R 0 0 Jz [below_min, fi_yes]
+R 0 0 Ret [0]
+R 0 0 Label [fi_pos_path]
+R 0 0 Gt [v, c_INT32_MAX] above_max
+R 0 0 Jz [above_max, fi_yes]
+R 0 0 Ret [0]
+R 0 0 Label [fi_yes]
+R 0 0 Ret [1]
+R 0 0 EndF
+
+# void bc_emit(int b)
+F 0 0 bc_emit [b]
+R 0 0 BitAnd [b, 255] bm
+R 0 0 StoreByte [g_bytecode, g_bytecode_len, bm]
+R 0 0 Add [g_bytecode_len, 1] g_bytecode_len
+R 0 0 Ret []
+R 0 0 EndF
+
+# void bc_emit_imm32(int v) -> 4 bytes LE
+F 0 0 bc_emit_imm32 [v]
+R 0 0 Call [bc_emit, v]
+R 0 0 Shr [v, 8] v1
+R 0 0 Call [bc_emit, v1]
+R 0 0 Shr [v, 16] v2
+R 0 0 Call [bc_emit, v2]
+R 0 0 Shr [v, 24] v3
+R 0 0 Call [bc_emit, v3]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void bc_emit_slot(int s): Lote 4 dual opcode. Si s<256 emite 1 byte.
+# Si s>=256: backpatch byte anterior OP_LOAD_VAR(6)->OP_LOAD_VAR16(50),
+# OP_STORE_VAR(7)->OP_STORE_VAR16(51), emite 2 bytes LE.
+F 0 0 bc_emit_slot [s]
+R 0 0 Lt [s, 256] is_small
+R 0 0 Jz [is_small, bes_big]
+R 0 0 Call [bc_emit, s]
+R 0 0 Ret []
+R 0 0 Label [bes_big]
+R 0 0 Sub [g_bytecode_len, 1] prev_pos
+R 0 0 LoadByte [g_bytecode, prev_pos] prev
+R 0 0 Eq [prev, 6] is_load
+R 0 0 Jz [is_load, bes_chk_store]
+R 0 0 StoreByte [g_bytecode, prev_pos, 50]
+R 0 0 Jmp [bes_emit_slot]
+R 0 0 Label [bes_chk_store]
+R 0 0 Eq [prev, 7] is_store
+R 0 0 Jz [is_store, bes_emit_slot]
+R 0 0 StoreByte [g_bytecode, prev_pos, 51]
+R 0 0 Label [bes_emit_slot]
+R 0 0 BitAnd [s, 255] lo
+R 0 0 Call [bc_emit, lo]
+R 0 0 Shr [s, 8] hi
+R 0 0 BitAnd [hi, 255] hi2
+R 0 0 Call [bc_emit, hi2]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void bc_emit_imm64(int v) -> 8 bytes LE
+F 0 0 bc_emit_imm64 [v]
+R 0 0 Call [bc_emit, v]
+R 0 0 Shr [v, 8] v1
+R 0 0 Call [bc_emit, v1]
+R 0 0 Shr [v, 16] v2
+R 0 0 Call [bc_emit, v2]
+R 0 0 Shr [v, 24] v3
+R 0 0 Call [bc_emit, v3]
+R 0 0 Shr [v, 32] v4
+R 0 0 Call [bc_emit, v4]
+R 0 0 Shr [v, 40] v5
+R 0 0 Call [bc_emit, v5]
+R 0 0 Shr [v, 48] v6
+R 0 0 Call [bc_emit, v6]
+R 0 0 Shr [v, 56] v7
+R 0 0 Call [bc_emit, v7]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void elf_emit_at(int off, int b)
+F 0 0 elf_emit_at [off, b]
+R 0 0 BitAnd [b, 255] bm
+R 0 0 StoreByte [g_elf, off, bm]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void elf_emit_u16_at(int off, int v)
+F 0 0 elf_emit_u16_at [off, v]
+R 0 0 BitAnd [v, 255] b0
+R 0 0 StoreByte [g_elf, off, b0]
+R 0 0 Shr [v, 8] s1
+R 0 0 BitAnd [s1, 255] b1
+R 0 0 Add [off, 1] off1
+R 0 0 StoreByte [g_elf, off1, b1]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void elf_emit_u32_at(int off, int v)
+F 0 0 elf_emit_u32_at [off, v]
+R 0 0 BitAnd [v, 255] b0
+R 0 0 StoreByte [g_elf, off, b0]
+R 0 0 Shr [v, 8] s1
+R 0 0 BitAnd [s1, 255] b1
+R 0 0 Add [off, 1] off1
+R 0 0 StoreByte [g_elf, off1, b1]
+R 0 0 Shr [v, 16] s2
+R 0 0 BitAnd [s2, 255] b2
+R 0 0 Add [off, 2] off2
+R 0 0 StoreByte [g_elf, off2, b2]
+R 0 0 Shr [v, 24] s3
+R 0 0 BitAnd [s3, 255] b3
+R 0 0 Add [off, 3] off3
+R 0 0 StoreByte [g_elf, off3, b3]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void elf_emit_u64_at(int off, int v)
+F 0 0 elf_emit_u64_at [off, v]
+R 0 0 BitAnd [v, 255] b0
+R 0 0 StoreByte [g_elf, off, b0]
+R 0 0 Shr [v, 8] s1
+R 0 0 BitAnd [s1, 255] b1
+R 0 0 Add [off, 1] off1
+R 0 0 StoreByte [g_elf, off1, b1]
+R 0 0 Shr [v, 16] s2
+R 0 0 BitAnd [s2, 255] b2
+R 0 0 Add [off, 2] off2
+R 0 0 StoreByte [g_elf, off2, b2]
+R 0 0 Shr [v, 24] s3
+R 0 0 BitAnd [s3, 255] b3
+R 0 0 Add [off, 3] off3
+R 0 0 StoreByte [g_elf, off3, b3]
+R 0 0 Shr [v, 32] s4
+R 0 0 BitAnd [s4, 255] b4
+R 0 0 Add [off, 4] off4
+R 0 0 StoreByte [g_elf, off4, b4]
+R 0 0 Shr [v, 40] s5
+R 0 0 BitAnd [s5, 255] b5
+R 0 0 Add [off, 5] off5
+R 0 0 StoreByte [g_elf, off5, b5]
+R 0 0 Shr [v, 48] s6
+R 0 0 BitAnd [s6, 255] b6
+R 0 0 Add [off, 6] off6
+R 0 0 StoreByte [g_elf, off6, b6]
+R 0 0 Shr [v, 56] s7
+R 0 0 BitAnd [s7, 255] b7
+R 0 0 Add [off, 7] off7
+R 0 0 StoreByte [g_elf, off7, b7]
+R 0 0 Ret []
+R 0 0 EndF
+
+# ============================================================================
+# F.7 m_arch_x86 - bytes handlers AMD64 + emit primitives (paralelo arch_x86.c)
+# ============================================================================
+# Layout:
+#   arch_all_handlers = buffer con todos los handler bytes concatenados (~541 B).
+#   arch_handler_offsets[idx] = offset en arch_all_handlers (i64).
+#   arch_handler_sizes_tbl[idx] = size del handler (i64).
+#   arch_cursor = cursor durante arch_init para construir buffer.
+
+D 0 0 c_HANDLERS_BUF_SIZE Integer 1024
+D 0 0 c_HANDLER_TABLE_BYTES Integer 512
+R 0 0 Alloc [c_HANDLERS_BUF_SIZE]   arch_all_handlers
+R 0 0 Alloc [c_HANDLER_TABLE_BYTES] arch_handler_offsets
+R 0 0 Alloc [c_HANDLER_TABLE_BYTES] arch_handler_sizes_tbl
+D 0 0 arch_cursor Integer 0
+
+# Append byte al buffer + avanza cursor.
+F 0 0 arch_ab [b]
+R 0 0 BitAnd [b, 255] bm
+R 0 0 StoreByte [arch_all_handlers, arch_cursor, bm]
+R 0 0 Add [arch_cursor, 1] arch_cursor
+R 0 0 Ret []
+R 0 0 EndF
+
+# Registra handler idx: offset = arch_cursor actual, size = size.
+F 0 0 arch_reg [idx, size]
+R 0 0 Mul [idx, 8] off
+R 0 0 StoreI64 [arch_handler_offsets, off, arch_cursor]
+R 0 0 StoreI64 [arch_handler_sizes_tbl, off, size]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Inicializa tablas de handlers con bytes x86 hardcoded (paralelo arch_x86.c h_*).
+F 0 0 arch_init []
+R 0 0 Add [0, 0] arch_cursor
+# idx 0 HALT (2): EB 00
+R 0 0 Call [arch_reg, 0, 2]
+R 0 0 Call [arch_ab, 235]
+R 0 0 Call [arch_ab, 0]
+# idx 1 LOAD_IMM32 (8): 49 63 07 49 83 C7 04 50
+R 0 0 Call [arch_reg, 1, 8]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 99]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 4]
+R 0 0 Call [arch_ab, 80]
+# idx 2 ADD (6): 58 59 48 01 C8 50
+R 0 0 Call [arch_reg, 2, 6]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 80]
+# idx 3 SUB (6): 59 58 48 29 C8 50
+R 0 0 Call [arch_reg, 3, 6]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 41]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 80]
+# idx 4 MUL (7): 58 59 48 0F AF C1 50
+R 0 0 Call [arch_reg, 4, 7]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 175]
+R 0 0 Call [arch_ab, 193]
+R 0 0 Call [arch_ab, 80]
+# idx 5 ADD_R12 (4): 58 49 01 C4
+R 0 0 Call [arch_reg, 5, 4]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 196]
+# idx 6 LOAD_VAR (11): 49 0F B6 07 49 FF C7 FF 74 C5 00
+R 0 0 Call [arch_reg, 6, 11]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 182]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 116]
+R 0 0 Call [arch_ab, 197]
+R 0 0 Call [arch_ab, 0]
+# idx 7 STORE_VAR (11): 49 0F B6 07 49 FF C7 8F 44 C5 00
+R 0 0 Call [arch_reg, 7, 11]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 182]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 143]
+R 0 0 Call [arch_ab, 68]
+R 0 0 Call [arch_ab, 197]
+R 0 0 Call [arch_ab, 0]
+# idx 8 JMP (11): 49 0F BF 07 49 83 C7 02 49 01 C7
+R 0 0 Call [arch_reg, 8, 11]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 191]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 2]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 199]
+# idx 9 JZ (17): 59 49 0F BF 07 49 83 C7 02 48 85 C9 75 03 49 01 C7
+R 0 0 Call [arch_reg, 9, 17]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 191]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 2]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 133]
+R 0 0 Call [arch_ab, 201]
+R 0 0 Call [arch_ab, 117]
+R 0 0 Call [arch_ab, 3]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 199]
+# idx 10 EQ (13): 59 58 48 39 C8 0F 94 C0 48 0F B6 C0 50
+R 0 0 Call [arch_reg, 10, 13]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 57]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 148]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 182]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 80]
+# idx 11 LT (13): 59 58 48 39 C8 0F 9C C0 48 0F B6 C0 50
+R 0 0 Call [arch_reg, 11, 13]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 57]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 156]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 182]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 80]
+# idx 12 FD_READ (9): 5A 5E 5F 48 31 C0 0F 05 50
+R 0 0 Call [arch_reg, 12, 9]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 13 FD_WRITE (13): 5A 5E 5F 48 C7 C0 01 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 13, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 14 ALLOC (41): 5F 48 C7 C0 09 00 00 00 48 89 FE 48 31 FF 48 C7 C2 03 00 00 00 49 C7 C2 22 00 00 00 49 C7 C0 FF FF FF FF 4D 31 C9 0F 05 50
+R 0 0 Call [arch_reg, 14, 41]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 9]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 137]
+R 0 0 Call [arch_ab, 254]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 194]
+R 0 0 Call [arch_ab, 3]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 194]
+R 0 0 Call [arch_ab, 34]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 77]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 201]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 15 LOAD_BYTE (8): 58 59 48 0F B6 04 01 50
+R 0 0 Call [arch_reg, 15, 8]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 182]
+R 0 0 Call [arch_ab, 4]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 80]
+# idx 16 STORE_BYTE (6): 58 5A 59 88 04 11
+R 0 0 Call [arch_reg, 16, 6]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 136]
+R 0 0 Call [arch_ab, 4]
+R 0 0 Call [arch_ab, 17]
+# idx 17 LOAD_I64 (7): 58 59 48 8B 04 01 50
+R 0 0 Call [arch_reg, 17, 7]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 139]
+R 0 0 Call [arch_ab, 4]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 80]
+# idx 18 STORE_I64 (7): 58 5A 59 48 89 04 11
+R 0 0 Call [arch_reg, 18, 7]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 137]
+R 0 0 Call [arch_ab, 4]
+R 0 0 Call [arch_ab, 17]
+# idx 19 EXIT_TOP (10): 5F 48 C7 C0 3C 00 00 00 0F 05
+R 0 0 Call [arch_reg, 19, 10]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 60]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+# idx 20 SHR (6): 59 58 48 D3 E8 50
+R 0 0 Call [arch_reg, 20, 6]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 211]
+R 0 0 Call [arch_ab, 232]
+R 0 0 Call [arch_ab, 80]
+# idx 21 BITAND (6): 59 58 48 21 C8 50
+R 0 0 Call [arch_reg, 21, 6]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 33]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 80]
+# idx 22 LOAD_IMM64 (8): 49 8B 07 49 83 C7 08 50
+R 0 0 Call [arch_reg, 22, 8]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 139]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 8]
+R 0 0 Call [arch_ab, 80]
+# idx 23 DIV (8): 59 58 48 99 48 F7 F9 50
+R 0 0 Call [arch_reg, 23, 8]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 153]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 247]
+R 0 0 Call [arch_ab, 249]
+R 0 0 Call [arch_ab, 80]
+# idx 24 MOD (8): 59 58 48 99 48 F7 F9 52
+R 0 0 Call [arch_reg, 24, 8]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 153]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 247]
+R 0 0 Call [arch_ab, 249]
+R 0 0 Call [arch_ab, 82]
+# idx 25 BITOR (6): 59 58 48 09 C8 50
+R 0 0 Call [arch_reg, 25, 6]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 9]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 80]
+# idx 26 SHL (6): 59 58 48 D3 E0 50
+R 0 0 Call [arch_reg, 26, 6]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 211]
+R 0 0 Call [arch_ab, 224]
+R 0 0 Call [arch_ab, 80]
+# idx 27 GT (13): 59 58 48 39 C8 0F 9F C0 48 0F B6 C0 50
+R 0 0 Call [arch_reg, 27, 13]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 57]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 159]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 182]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 80]
+# idx 28 BITXOR (6): 59 58 48 31 C8 50
+R 0 0 Call [arch_reg, 28, 6]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 200]
+R 0 0 Call [arch_ab, 80]
+# idx 29 CALL (13): 49 0F BF 07 49 83 C7 02 41 57 49 01 C7
+R 0 0 Call [arch_reg, 29, 13]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 191]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 2]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 87]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 1]
+R 0 0 Call [arch_ab, 199]
+# idx 30 RET (2): 41 5F
+R 0 0 Call [arch_reg, 30, 2]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 95]
+# idx 31 OPEN (15): 5E 5F 48 C7 C0 02 00 00 00 48 31 D2 0F 05 50
+R 0 0 Call [arch_reg, 31, 15]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 2]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 210]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 32 CLOSE (11): 5F 48 C7 C0 03 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 32, 11]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 3]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 33 IOCTL (13): 5A 5E 5F 48 C7 C0 10 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 33, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 16]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 34 NANOSLEEP (12): 5E 5F 48 C7 C0 23 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 34, 12]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 35]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 35 POLL (13): 5A 5E 5F 48 C7 C0 07 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 35, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 36 FORK (10): 48 C7 C0 39 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 36, 10]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 57]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 37 EXECVE (13): 5A 5E 5F 48 C7 C0 3B 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 37, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 59]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 38 WAIT4 (15): 41 5A 5A 5E 5F 48 C7 C0 3D 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 38, 15]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 61]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 39 PIPE (11): 5F 48 C7 C0 16 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 39, 11]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 22]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 40 DUP2 (12): 5E 5F 48 C7 C0 21 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 40, 12]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 33]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 41 SOCKET (13): 5A 5E 5F 48 C7 C0 29 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 41, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 41]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 42 CONNECT (13): 5A 5E 5F 48 C7 C0 2A 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 42, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 42]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 43 BIND (13): 5A 5E 5F 48 C7 C0 31 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 43, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 44 LISTEN (12): 5E 5F 48 C7 C0 32 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 44, 12]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 50]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 45 ACCEPT (13): 5A 5E 5F 48 C7 C0 2B 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 45, 13]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 43]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 46 MMAP_FD (21): 41 59 41 58 41 5A 5A 5E 48 31 FF 48 C7 C0 09 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 46, 21]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 89]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 88]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 49]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 9]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 47 MUNMAP (12): 5E 5F 48 C7 C0 0B 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 47, 12]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 11]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 48 GETTIMEOFDAY (12): 5E 5F 48 C7 C0 60 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 48, 12]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 96]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 49 RT_SIGACTION (15): 41 5A 5A 5E 5F 48 C7 C0 0D 00 00 00 0F 05 50
+R 0 0 Call [arch_reg, 49, 15]
+R 0 0 Call [arch_ab, 65]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 90]
+R 0 0 Call [arch_ab, 94]
+R 0 0 Call [arch_ab, 95]
+R 0 0 Call [arch_ab, 72]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 192]
+R 0 0 Call [arch_ab, 13]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 5]
+R 0 0 Call [arch_ab, 80]
+# idx 50 LOAD_VAR16 (12): 49 0F B7 07 49 83 C7 02 FF 74 C5 00 (Lote 4)
+R 0 0 Call [arch_reg, 50, 12]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 183]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 2]
+R 0 0 Call [arch_ab, 255]
+R 0 0 Call [arch_ab, 116]
+R 0 0 Call [arch_ab, 197]
+R 0 0 Call [arch_ab, 0]
+# idx 51 STORE_VAR16 (12): 49 0F B7 07 49 83 C7 02 8F 44 C5 00 (Lote 4)
+R 0 0 Call [arch_reg, 51, 12]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 15]
+R 0 0 Call [arch_ab, 183]
+R 0 0 Call [arch_ab, 7]
+R 0 0 Call [arch_ab, 73]
+R 0 0 Call [arch_ab, 131]
+R 0 0 Call [arch_ab, 199]
+R 0 0 Call [arch_ab, 2]
+R 0 0 Call [arch_ab, 143]
+R 0 0 Call [arch_ab, 68]
+R 0 0 Call [arch_ab, 197]
+R 0 0 Call [arch_ab, 0]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Constantes simples (paralelo a arch_x86.c interface).
+F 0 0 arch_e_machine []
+R 0 0 Ret [62]
+R 0 0 EndF
+F 0 0 arch_base_vaddr []
+R 0 0 Ret [4194304]
+R 0 0 EndF
+F 0 0 arch_jt_entry_bytes []
+R 0 0 Ret [8]
+R 0 0 EndF
+F 0 0 arch_setup_size []
+R 0 0 Ret [17]
+R 0 0 EndF
+F 0 0 arch_dispatch_size []
+R 0 0 Ret [17]
+R 0 0 EndF
+F 0 0 arch_tail_size []
+R 0 0 Ret [12]
+R 0 0 EndF
+F 0 0 arch_jmp_back_size []
+R 0 0 Ret [5]
+R 0 0 EndF
+F 0 0 arch_handler_is_halt [idx]
+R 0 0 Eq [idx, 0] r
+R 0 0 Ret [r]
+R 0 0 EndF
+F 0 0 arch_handler_is_exit [idx]
+R 0 0 Eq [idx, 19] r
+R 0 0 Ret [r]
+R 0 0 EndF
+
+# Sizes y ptrs: via tablas arch_handler_offsets / arch_handler_sizes_tbl.
+F 0 0 arch_handler_size [idx]
+R 0 0 Mul [idx, 8] off
+R 0 0 LoadI64 [arch_handler_sizes_tbl, off] sz
+R 0 0 Ret [sz]
+R 0 0 EndF
+
+# arch_handler_ptr en C retorna int* (puntero). En .777m equivalente: retornamos
+# ABS_ADDR = arch_all_handlers + offset (suma puntero base + offset). Caller usa
+# LoadByte [ptr_returned, byte_idx] para leer bytes individuales.
+F 0 0 arch_handler_ptr [idx]
+R 0 0 Mul [idx, 8] off
+R 0 0 LoadI64 [arch_handler_offsets, off] handler_off
+R 0 0 Add [arch_all_handlers, handler_off] ptr
+R 0 0 Ret [ptr]
+R 0 0 EndF
+
+# Emit prologo en g_elf at off: xor r12,r12; lea r15,[rip+bc_disp]; lea rbp,[rip+vars_disp]
+F 0 0 arch_emit_setup [base, bc_disp, vars_disp]
+R 0 0 Call [elf_emit_at, base, 77]
+R 0 0 Add [base, 1] p
+R 0 0 Call [elf_emit_at, p, 49]
+R 0 0 Add [base, 2] p
+R 0 0 Call [elf_emit_at, p, 228]
+R 0 0 Add [base, 3] p
+R 0 0 Call [elf_emit_at, p, 76]
+R 0 0 Add [base, 4] p
+R 0 0 Call [elf_emit_at, p, 141]
+R 0 0 Add [base, 5] p
+R 0 0 Call [elf_emit_at, p, 61]
+R 0 0 Add [base, 6] p
+R 0 0 Call [elf_emit_u32_at, p, bc_disp]
+R 0 0 Add [base, 10] p
+R 0 0 Call [elf_emit_at, p, 72]
+R 0 0 Add [base, 11] p
+R 0 0 Call [elf_emit_at, p, 141]
+R 0 0 Add [base, 12] p
+R 0 0 Call [elf_emit_at, p, 45]
+R 0 0 Add [base, 13] p
+R 0 0 Call [elf_emit_u32_at, p, vars_disp]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Emit dispatch loop en g_elf at off
+F 0 0 arch_emit_dispatch [base, jt_disp]
+R 0 0 Call [elf_emit_at, base, 73]
+R 0 0 Add [base, 1] p
+R 0 0 Call [elf_emit_at, p, 15]
+R 0 0 Add [base, 2] p
+R 0 0 Call [elf_emit_at, p, 182]
+R 0 0 Add [base, 3] p
+R 0 0 Call [elf_emit_at, p, 7]
+R 0 0 Add [base, 4] p
+R 0 0 Call [elf_emit_at, p, 73]
+R 0 0 Add [base, 5] p
+R 0 0 Call [elf_emit_at, p, 255]
+R 0 0 Add [base, 6] p
+R 0 0 Call [elf_emit_at, p, 199]
+R 0 0 Add [base, 7] p
+R 0 0 Call [elf_emit_at, p, 72]
+R 0 0 Add [base, 8] p
+R 0 0 Call [elf_emit_at, p, 141]
+R 0 0 Add [base, 9] p
+R 0 0 Call [elf_emit_at, p, 13]
+R 0 0 Add [base, 10] p
+R 0 0 Call [elf_emit_u32_at, p, jt_disp]
+R 0 0 Add [base, 14] p
+R 0 0 Call [elf_emit_at, p, 255]
+R 0 0 Add [base, 15] p
+R 0 0 Call [elf_emit_at, p, 36]
+R 0 0 Add [base, 16] p
+R 0 0 Call [elf_emit_at, p, 193]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Emit epilogo: mov rdi,r12; mov rax,60; syscall
+F 0 0 arch_emit_tail [base]
+R 0 0 Call [elf_emit_at, base, 76]
+R 0 0 Add [base, 1] p
+R 0 0 Call [elf_emit_at, p, 137]
+R 0 0 Add [base, 2] p
+R 0 0 Call [elf_emit_at, p, 231]
+R 0 0 Add [base, 3] p
+R 0 0 Call [elf_emit_at, p, 72]
+R 0 0 Add [base, 4] p
+R 0 0 Call [elf_emit_at, p, 199]
+R 0 0 Add [base, 5] p
+R 0 0 Call [elf_emit_at, p, 192]
+R 0 0 Add [base, 6] p
+R 0 0 Call [elf_emit_at, p, 60]
+R 0 0 Add [base, 7] p
+R 0 0 Call [elf_emit_at, p, 0]
+R 0 0 Add [base, 8] p
+R 0 0 Call [elf_emit_at, p, 0]
+R 0 0 Add [base, 9] p
+R 0 0 Call [elf_emit_at, p, 0]
+R 0 0 Add [base, 10] p
+R 0 0 Call [elf_emit_at, p, 15]
+R 0 0 Add [base, 11] p
+R 0 0 Call [elf_emit_at, p, 5]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Emit jmp near + disp32: E9 + disp32 (5 bytes)
+F 0 0 arch_emit_jmp_back [base, disp]
+R 0 0 Call [elf_emit_at, base, 233]
+R 0 0 Add [base, 1] p
+R 0 0 Call [elf_emit_u32_at, p, disp]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Patch HALT marker: sobreescribe 2 bytes con jmp near (5 bytes)
+F 0 0 arch_emit_halt_jmp [base, disp]
+R 0 0 Call [arch_emit_jmp_back, base, disp]
+R 0 0 Ret []
+R 0 0 EndF
+
+# ============================================================================
+# F.9 m_parser_helpers - parser helpers (paralelo compilador_777.c 1078-1233)
+# ============================================================================
+# Convencion: parse_pos es global mutable. F lo leen y avanzan.
+# Tokens devuelven (token_start_off, token_len) en globals g_tok_off / g_tok_len.
+
+D 0 0 parse_pos Integer 0
+D 0 0 g_tok_off Integer 0
+D 0 0 g_tok_len Integer 0
+
+# void skip_to_eol(): avanza parse_pos despues del primer '\n'.
+F 0 0 skip_to_eol [end]
+R 0 0 Label [ste_loop]
+R 0 0 Lt [parse_pos, end] cond
+R 0 0 Jz [cond, ste_done]
+R 0 0 LoadByte [g_source, parse_pos] b
+R 0 0 Eq [b, 10] is_nl
+R 0 0 Jz [is_nl, ste_skip_inc]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Ret []
+R 0 0 Label [ste_skip_inc]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [ste_loop]
+R 0 0 Label [ste_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# void next_token(end): setea g_tok_off / g_tok_len y avanza parse_pos.
+# Soporta quoted strings con escapes.
+F 0 0 next_token [end]
+# Skip ws
+R 0 0 Label [nt_skip]
+R 0 0 Lt [parse_pos, end] cond
+R 0 0 Jz [cond, nt_done_skip]
+R 0 0 LoadByte [g_source, parse_pos] c
+R 0 0 Eq [c, 32] is_sp
+R 0 0 Jz [is_sp, nt_chk_tab]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [nt_skip]
+R 0 0 Label [nt_chk_tab]
+R 0 0 Eq [c, 9] is_tab
+R 0 0 Jz [is_tab, nt_done_skip]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [nt_skip]
+R 0 0 Label [nt_done_skip]
+R 0 0 Add [parse_pos, 0] start
+# Si quoted "...":
+R 0 0 Lt [parse_pos, end] cond
+R 0 0 Jz [cond, nt_normal]
+R 0 0 LoadByte [g_source, parse_pos] c
+R 0 0 Eq [c, 34] is_quote
+R 0 0 Jz [is_quote, nt_normal]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Label [nt_qloop]
+R 0 0 Lt [parse_pos, end] cond
+R 0 0 Jz [cond, nt_qdone]
+R 0 0 LoadByte [g_source, parse_pos] c
+R 0 0 Eq [c, 34] is_close
+R 0 0 Jz [is_close, nt_qchk_esc]
+R 0 0 Jmp [nt_qdone]
+R 0 0 Label [nt_qchk_esc]
+R 0 0 Eq [c, 92] is_esc
+R 0 0 Jz [is_esc, nt_qadv1]
+R 0 0 Add [parse_pos, 1] next_p
+R 0 0 Lt [next_p, end] within
+R 0 0 Jz [within, nt_qadv1]
+R 0 0 Add [parse_pos, 2] parse_pos
+R 0 0 Jmp [nt_qloop]
+R 0 0 Label [nt_qadv1]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [nt_qloop]
+R 0 0 Label [nt_qdone]
+R 0 0 Lt [parse_pos, end] cond
+R 0 0 Jz [cond, nt_qend]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Label [nt_qend]
+R 0 0 Sub [parse_pos, start] len_v
+R 0 0 Add [start, 0] g_tok_off
+R 0 0 Add [len_v, 0] g_tok_len
+R 0 0 Ret []
+R 0 0 Label [nt_normal]
+R 0 0 Label [nt_nloop]
+R 0 0 Lt [parse_pos, end] cond
+R 0 0 Jz [cond, nt_ndone]
+R 0 0 LoadByte [g_source, parse_pos] c
+R 0 0 Eq [c, 32] is_sp
+R 0 0 Jz [is_sp, nt_chk_t]
+R 0 0 Jmp [nt_ndone]
+R 0 0 Label [nt_chk_t]
+R 0 0 Eq [c, 9] is_t
+R 0 0 Jz [is_t, nt_chk_nl]
+R 0 0 Jmp [nt_ndone]
+R 0 0 Label [nt_chk_nl]
+R 0 0 Eq [c, 10] is_n
+R 0 0 Jz [is_n, nt_chk_cr]
+R 0 0 Jmp [nt_ndone]
+R 0 0 Label [nt_chk_cr]
+R 0 0 Eq [c, 13] is_r
+R 0 0 Jz [is_r, nt_advance]
+R 0 0 Jmp [nt_ndone]
+R 0 0 Label [nt_advance]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [nt_nloop]
+R 0 0 Label [nt_ndone]
+R 0 0 Sub [parse_pos, start] len_v
+R 0 0 Add [start, 0] g_tok_off
+R 0 0 Add [len_v, 0] g_tok_len
+R 0 0 Ret []
+R 0 0 EndF
+
+# int eq_str_lit(int a_off, int alen, char* lit) -> 1 si bytes en g_source[a_off..a_off+alen]
+# coinciden EXACTAMENTE con lit (terminado en 0).
+F 0 0 eq_str_lit [a_off, alen, lit]
+R 0 0 Add [0, 0] i
+R 0 0 Label [esl_loop]
+R 0 0 Lt [i, alen] cond
+R 0 0 Jz [cond, esl_post]
+R 0 0 LoadByte [lit, i] b_lit
+R 0 0 Eq [b_lit, 0] hit_zero
+R 0 0 Jz [hit_zero, esl_compare]
+R 0 0 Ret [0]
+R 0 0 Label [esl_compare]
+R 0 0 Add [a_off, i] src_pos
+R 0 0 LoadByte [g_source, src_pos] b_src
+R 0 0 Eq [b_lit, b_src] match
+R 0 0 Jz [match, esl_neq]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [esl_loop]
+R 0 0 Label [esl_post]
+R 0 0 LoadByte [lit, alen] b_term
+R 0 0 Eq [b_term, 0] is_term
+R 0 0 Jz [is_term, esl_neq]
+R 0 0 Ret [1]
+R 0 0 Label [esl_neq]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# int is_valid_ident_at(int off, int len): adaptador. Lee bytes de g_source.
+F 0 0 is_valid_ident_at [off, len]
+R 0 0 Add [g_source, off] ptr
+R 0 0 Call [is_valid_ident, ptr, len] r
+R 0 0 Ret [r]
+R 0 0 EndF
+
+# int parse_i64_at(int off, int len): adaptador.
+F 0 0 parse_i64_at [off, len]
+R 0 0 Add [g_source, off] ptr
+R 0 0 Call [parse_i64, ptr, len] r
+R 0 0 Ret [r]
+R 0 0 EndF
+
+# int emit_load_arg_at(int arg_off, int alen): emite LOAD_VAR si ident, sino LOAD_IMM32/64.
+# Retorna 0 OK, 1 si error.
+F 0 0 emit_load_arg_at [arg_off, alen]
+R 0 0 Eq [alen, 0] empty
+R 0 0 Jz [empty, ela_lenok]
+R 0 0 Ret [1]
+R 0 0 Label [ela_lenok]
+R 0 0 Call [is_valid_ident_at, arg_off, alen] is_ident
+R 0 0 Jz [is_ident, ela_try_num]
+R 0 0 Add [g_source, arg_off] name_ptr
+R 0 0 Call [sym_intern, name_ptr, alen] slot
+R 0 0 Lt [slot, 0] bad
+R 0 0 Jz [bad, ela_emit_var]
+R 0 0 Ret [1]
+R 0 0 Label [ela_emit_var]
+R 0 0 Call [bc_emit, 6]
+R 0 0 Call [bc_emit_slot, slot]
+R 0 0 Ret [0]
+R 0 0 Label [ela_try_num]
+R 0 0 Call [parse_i64_at, arg_off, alen] val
+R 0 0 Eq [g_parse_err, 0] ok
+R 0 0 Jz [ok, ela_ret_fail]
+R 0 0 Label [ela_emit_num]
+R 0 0 Call [fits_in_i32, val] is32
+R 0 0 Jz [is32, ela_emit64]
+R 0 0 Call [bc_emit, 1]
+R 0 0 Call [bc_emit_imm32, val]
+R 0 0 Ret [0]
+R 0 0 Label [ela_emit64]
+R 0 0 Call [bc_emit, 22]
+R 0 0 Call [bc_emit_imm64, val]
+R 0 0 Ret [0]
+R 0 0 Label [ela_ret_fail]
+R 0 0 Ret [1]
+R 0 0 EndF
+
+# Kinds: tabla simple de strings constantes para opcode_from_kind.
+# Lit strings declarados top-level. opcode_from_kind itera.
+D 0 0 k_Add Text "Add\0"
+D 0 0 k_Sub Text "Sub\0"
+D 0 0 k_Mul Text "Mul\0"
+D 0 0 k_Eq Text "Eq\0"
+D 0 0 k_Lt Text "Lt\0"
+D 0 0 k_Alloc Text "Alloc\0"
+D 0 0 k_FdRead Text "FdRead\0"
+D 0 0 k_FdWrite Text "FdWrite\0"
+D 0 0 k_LoadByte Text "LoadByte\0"
+D 0 0 k_StoreByte Text "StoreByte\0"
+D 0 0 k_LoadI64 Text "LoadI64\0"
+D 0 0 k_StoreI64 Text "StoreI64\0"
+D 0 0 k_Shr Text "Shr\0"
+D 0 0 k_BitAnd Text "BitAnd\0"
+D 0 0 k_Div Text "Div\0"
+D 0 0 k_Mod Text "Mod\0"
+D 0 0 k_BitOr Text "BitOr\0"
+D 0 0 k_Shl Text "Shl\0"
+D 0 0 k_Gt Text "Gt\0"
+D 0 0 k_BitXor Text "BitXor\0"
+D 0 0 k_Open Text "Open\0"
+D 0 0 k_Close Text "Close\0"
+D 0 0 k_Ioctl Text "Ioctl\0"
+D 0 0 k_Nanosleep Text "Nanosleep\0"
+D 0 0 k_Poll Text "Poll\0"
+D 0 0 k_Fork Text "Fork\0"
+D 0 0 k_Execve Text "Execve\0"
+D 0 0 k_Wait4 Text "Wait4\0"
+D 0 0 k_Pipe Text "Pipe\0"
+D 0 0 k_Dup2 Text "Dup2\0"
+D 0 0 k_Socket Text "Socket\0"
+D 0 0 k_Connect Text "Connect\0"
+D 0 0 k_Bind Text "Bind\0"
+D 0 0 k_Listen Text "Listen\0"
+D 0 0 k_Accept Text "Accept\0"
+D 0 0 k_MmapFd Text "MmapFd\0"
+D 0 0 k_Munmap Text "Munmap\0"
+D 0 0 k_GetTimeOfDay Text "GetTimeOfDay\0"
+D 0 0 k_RtSigAction Text "RtSigAction\0"
+
+# int opcode_from_kind_at(int kind_off, int klen) -> opcode o -1.
+F 0 0 opcode_from_kind_at [kind_off, klen]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Add] m
+R 0 0 Jz [m, ofk_chk_Sub]
+R 0 0 Ret [2]
+R 0 0 Label [ofk_chk_Sub]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Sub] m
+R 0 0 Jz [m, ofk_chk_Mul]
+R 0 0 Ret [3]
+R 0 0 Label [ofk_chk_Mul]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Mul] m
+R 0 0 Jz [m, ofk_chk_Eq]
+R 0 0 Ret [4]
+R 0 0 Label [ofk_chk_Eq]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Eq] m
+R 0 0 Jz [m, ofk_chk_Lt]
+R 0 0 Ret [10]
+R 0 0 Label [ofk_chk_Lt]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Lt] m
+R 0 0 Jz [m, ofk_chk_Alloc]
+R 0 0 Ret [11]
+R 0 0 Label [ofk_chk_Alloc]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Alloc] m
+R 0 0 Jz [m, ofk_chk_FdRead]
+R 0 0 Ret [14]
+R 0 0 Label [ofk_chk_FdRead]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_FdRead] m
+R 0 0 Jz [m, ofk_chk_FdWrite]
+R 0 0 Ret [12]
+R 0 0 Label [ofk_chk_FdWrite]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_FdWrite] m
+R 0 0 Jz [m, ofk_chk_LoadByte]
+R 0 0 Ret [13]
+R 0 0 Label [ofk_chk_LoadByte]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_LoadByte] m
+R 0 0 Jz [m, ofk_chk_StoreByte]
+R 0 0 Ret [15]
+R 0 0 Label [ofk_chk_StoreByte]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_StoreByte] m
+R 0 0 Jz [m, ofk_chk_LoadI64]
+R 0 0 Ret [16]
+R 0 0 Label [ofk_chk_LoadI64]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_LoadI64] m
+R 0 0 Jz [m, ofk_chk_StoreI64]
+R 0 0 Ret [17]
+R 0 0 Label [ofk_chk_StoreI64]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_StoreI64] m
+R 0 0 Jz [m, ofk_chk_Shr]
+R 0 0 Ret [18]
+R 0 0 Label [ofk_chk_Shr]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Shr] m
+R 0 0 Jz [m, ofk_chk_BitAnd]
+R 0 0 Ret [20]
+R 0 0 Label [ofk_chk_BitAnd]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_BitAnd] m
+R 0 0 Jz [m, ofk_chk_Div]
+R 0 0 Ret [21]
+R 0 0 Label [ofk_chk_Div]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Div] m
+R 0 0 Jz [m, ofk_chk_Mod]
+R 0 0 Ret [23]
+R 0 0 Label [ofk_chk_Mod]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Mod] m
+R 0 0 Jz [m, ofk_chk_BitOr]
+R 0 0 Ret [24]
+R 0 0 Label [ofk_chk_BitOr]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_BitOr] m
+R 0 0 Jz [m, ofk_chk_Shl]
+R 0 0 Ret [25]
+R 0 0 Label [ofk_chk_Shl]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Shl] m
+R 0 0 Jz [m, ofk_chk_Gt]
+R 0 0 Ret [26]
+R 0 0 Label [ofk_chk_Gt]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Gt] m
+R 0 0 Jz [m, ofk_chk_BitXor]
+R 0 0 Ret [27]
+R 0 0 Label [ofk_chk_BitXor]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_BitXor] m
+R 0 0 Jz [m, ofk_chk_Open]
+R 0 0 Ret [28]
+R 0 0 Label [ofk_chk_Open]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Open] m
+R 0 0 Jz [m, ofk_chk_Close]
+R 0 0 Ret [31]
+R 0 0 Label [ofk_chk_Close]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Close] m
+R 0 0 Jz [m, ofk_chk_Ioctl]
+R 0 0 Ret [32]
+R 0 0 Label [ofk_chk_Ioctl]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Ioctl] m
+R 0 0 Jz [m, ofk_chk_Nanosleep]
+R 0 0 Ret [33]
+R 0 0 Label [ofk_chk_Nanosleep]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Nanosleep] m
+R 0 0 Jz [m, ofk_chk_Poll]
+R 0 0 Ret [34]
+R 0 0 Label [ofk_chk_Poll]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Poll] m
+R 0 0 Jz [m, ofk_chk_Fork]
+R 0 0 Ret [35]
+R 0 0 Label [ofk_chk_Fork]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Fork] m
+R 0 0 Jz [m, ofk_chk_Execve]
+R 0 0 Ret [36]
+R 0 0 Label [ofk_chk_Execve]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Execve] m
+R 0 0 Jz [m, ofk_chk_Wait4]
+R 0 0 Ret [37]
+R 0 0 Label [ofk_chk_Wait4]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Wait4] m
+R 0 0 Jz [m, ofk_chk_Pipe]
+R 0 0 Ret [38]
+R 0 0 Label [ofk_chk_Pipe]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Pipe] m
+R 0 0 Jz [m, ofk_chk_Dup2]
+R 0 0 Ret [39]
+R 0 0 Label [ofk_chk_Dup2]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Dup2] m
+R 0 0 Jz [m, ofk_chk_Socket]
+R 0 0 Ret [40]
+R 0 0 Label [ofk_chk_Socket]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Socket] m
+R 0 0 Jz [m, ofk_chk_Connect]
+R 0 0 Ret [41]
+R 0 0 Label [ofk_chk_Connect]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Connect] m
+R 0 0 Jz [m, ofk_chk_Bind]
+R 0 0 Ret [42]
+R 0 0 Label [ofk_chk_Bind]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Bind] m
+R 0 0 Jz [m, ofk_chk_Listen]
+R 0 0 Ret [43]
+R 0 0 Label [ofk_chk_Listen]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Listen] m
+R 0 0 Jz [m, ofk_chk_Accept]
+R 0 0 Ret [44]
+R 0 0 Label [ofk_chk_Accept]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Accept] m
+R 0 0 Jz [m, ofk_chk_MmapFd]
+R 0 0 Ret [45]
+R 0 0 Label [ofk_chk_MmapFd]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_MmapFd] m
+R 0 0 Jz [m, ofk_chk_Munmap]
+R 0 0 Ret [46]
+R 0 0 Label [ofk_chk_Munmap]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_Munmap] m
+R 0 0 Jz [m, ofk_chk_GTOD]
+R 0 0 Ret [47]
+R 0 0 Label [ofk_chk_GTOD]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_GetTimeOfDay] m
+R 0 0 Jz [m, ofk_chk_RtSig]
+R 0 0 Ret [48]
+R 0 0 Label [ofk_chk_RtSig]
+R 0 0 Call [eq_str_lit, kind_off, klen, k_RtSigAction] m
+R 0 0 Jz [m, ofk_unknown]
+R 0 0 Ret [49]
+R 0 0 Label [ofk_unknown]
+R 0 0 Ret [-1]
+R 0 0 EndF
+
+# int is_void_kind(int op): 1 si StoreByte (16) o StoreI64 (18).
+F 0 0 is_void_kind [op]
+R 0 0 Eq [op, 16] is_sb
+R 0 0 Jz [is_sb, ivk_chk_si]
+R 0 0 Ret [1]
+R 0 0 Label [ivk_chk_si]
+R 0 0 Eq [op, 18] is_si
+R 0 0 Jz [is_si, ivk_no]
+R 0 0 Ret [1]
+R 0 0 Label [ivk_no]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# ============================================================================
+# F.8 m_elf - build_vm_elf (paralelo compilador_777.c 857-1064)
+# ============================================================================
+# Tabla buffer global para handler_offsets (en C era local int[64], aqui global).
+R 0 0 Alloc [c_HANDLER_TABLE_BYTES] elf_handler_offsets
+
+# void build_vm_elf()
+F 0 0 build_vm_elf []
+R 0 0 Call [arch_setup_size] setup_size
+R 0 0 Call [arch_dispatch_size] dloop_size
+R 0 0 Call [arch_jmp_back_size] jb_size
+R 0 0 Call [arch_jt_entry_bytes] jte_bytes
+R 0 0 Call [arch_tail_size] tail_size_v
+R 0 0 Call [arch_base_vaddr] base_vaddr_v
+R 0 0 Add [setup_size, dloop_size] cur
+# Compute handler_offsets per opcode
+R 0 0 Add [0, 0] i
+R 0 0 Label [bve_off_loop]
+R 0 0 Lt [i, c_NUM_OPCODES] cond
+R 0 0 Jz [cond, bve_off_done]
+R 0 0 Mul [i, 8] ioff
+R 0 0 StoreI64 [elf_handler_offsets, ioff, cur]
+R 0 0 Call [arch_handler_size, i] hbytes_len
+R 0 0 Call [arch_handler_is_halt, i] is_halt
+R 0 0 Jz [is_halt, bve_chk_exit]
+R 0 0 Add [cur, jb_size] cur
+R 0 0 Jmp [bve_off_next]
+R 0 0 Label [bve_chk_exit]
+R 0 0 Call [arch_handler_is_exit, i] is_exit
+R 0 0 Jz [is_exit, bve_normal]
+R 0 0 Add [cur, hbytes_len] cur
+R 0 0 Jmp [bve_off_next]
+R 0 0 Label [bve_normal]
+R 0 0 Add [cur, hbytes_len] cur
+R 0 0 Add [cur, jb_size] cur
+R 0 0 Label [bve_off_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [bve_off_loop]
+R 0 0 Label [bve_off_done]
+R 0 0 Add [cur, 0] tail_offset
+R 0 0 Add [tail_offset, tail_size_v] vm_code_size
+R 0 0 Add [vm_code_size, 0] jt_offset
+R 0 0 Mul [c_NUM_OPCODES, jte_bytes] jt_size_v
+R 0 0 Add [jt_offset, jt_size_v] vars_offset
+R 0 0 Add [vars_offset, c_VARS_AREA_SIZE] bc_offset
+R 0 0 Add [c_HEADER_TOTAL, bc_offset] tmp1
+R 0 0 Add [tmp1, g_bytecode_len] total_file_size
+R 0 0 Add [total_file_size, 0] g_elf_len
+# Zero g_elf buffer hasta total_file_size
+R 0 0 Add [0, 0] i
+R 0 0 Label [bve_zero]
+R 0 0 Lt [i, total_file_size] cond
+R 0 0 Jz [cond, bve_zdone]
+R 0 0 StoreByte [g_elf, i, 0]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [bve_zero]
+R 0 0 Label [bve_zdone]
+# entry = base_vaddr + HEADER_TOTAL
+R 0 0 Add [base_vaddr_v, c_HEADER_TOTAL] entry
+# ELF header magic
+R 0 0 StoreByte [g_elf, 0, 127]
+R 0 0 StoreByte [g_elf, 1, 69]
+R 0 0 StoreByte [g_elf, 2, 76]
+R 0 0 StoreByte [g_elf, 3, 70]
+R 0 0 StoreByte [g_elf, 4, 2]
+R 0 0 StoreByte [g_elf, 5, 1]
+R 0 0 StoreByte [g_elf, 6, 1]
+# e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum
+R 0 0 Call [elf_emit_u16_at, 16, 2]
+R 0 0 Call [arch_e_machine] em
+R 0 0 Call [elf_emit_u16_at, 18, em]
+R 0 0 Call [elf_emit_u32_at, 20, 1]
+R 0 0 Call [elf_emit_u64_at, 24, entry]
+R 0 0 Call [elf_emit_u64_at, 32, 64]
+R 0 0 Call [elf_emit_u64_at, 40, 0]
+R 0 0 Call [elf_emit_u32_at, 48, 0]
+R 0 0 Call [elf_emit_u16_at, 52, 64]
+R 0 0 Call [elf_emit_u16_at, 54, 56]
+R 0 0 Call [elf_emit_u16_at, 56, 1]
+# Program header
+R 0 0 Call [elf_emit_u32_at, 64, 1]
+R 0 0 Call [elf_emit_u32_at, 68, 7]
+R 0 0 Call [elf_emit_u64_at, 72, 0]
+R 0 0 Call [elf_emit_u64_at, 80, base_vaddr_v]
+R 0 0 Call [elf_emit_u64_at, 88, base_vaddr_v]
+R 0 0 Call [elf_emit_u64_at, 96, total_file_size]
+R 0 0 Call [elf_emit_u64_at, 104, total_file_size]
+R 0 0 Call [elf_emit_u64_at, 112, 4096]
+# vm_base = HEADER_TOTAL
+R 0 0 Add [c_HEADER_TOTAL, 0] vm_base
+# Setup: lea r15 displacements
+R 0 0 Add [vm_base, 10] lea_r15_post
+R 0 0 Add [vm_base, bc_offset] bc_abs
+R 0 0 Sub [bc_abs, lea_r15_post] disp_bc
+R 0 0 Add [vm_base, 17] lea_rbp_post
+R 0 0 Add [vm_base, vars_offset] vars_abs
+R 0 0 Sub [vars_abs, lea_rbp_post] disp_vars
+R 0 0 Call [arch_emit_setup, vm_base, disp_bc, disp_vars]
+# Dispatch loop
+R 0 0 Add [vm_base, setup_size] dloop_abs
+R 0 0 Add [dloop_abs, 14] lea_rcx_post
+R 0 0 Add [vm_base, jt_offset] jt_abs
+R 0 0 Sub [jt_abs, lea_rcx_post] disp_jt
+R 0 0 Call [arch_emit_dispatch, dloop_abs, disp_jt]
+# Handlers loop
+R 0 0 Add [vm_base, tail_offset] tail_abs
+R 0 0 Add [0, 0] i
+R 0 0 Label [bve_h_loop]
+R 0 0 Lt [i, c_NUM_OPCODES] cond
+R 0 0 Jz [cond, bve_h_done]
+R 0 0 Mul [i, 8] ioff
+R 0 0 LoadI64 [elf_handler_offsets, ioff] h_off
+R 0 0 Add [vm_base, h_off] h_abs
+R 0 0 Call [arch_handler_ptr, i] hbytes_ptr
+R 0 0 Call [arch_handler_size, i] hbytes_len
+R 0 0 Call [arch_handler_is_halt, i] is_halt
+R 0 0 Jz [is_halt, bve_h_chk_exit]
+R 0 0 Add [h_abs, jb_size] h_post
+R 0 0 Sub [tail_abs, h_post] disp_h
+R 0 0 Call [arch_emit_halt_jmp, h_abs, disp_h]
+R 0 0 Jmp [bve_h_next]
+R 0 0 Label [bve_h_chk_exit]
+R 0 0 Call [arch_handler_is_exit, i] is_exit
+R 0 0 Jz [is_exit, bve_h_normal]
+# Exit handler: copia bytes, no jmp back.
+R 0 0 Add [0, 0] j
+R 0 0 Label [bve_h_excopy]
+R 0 0 Lt [j, hbytes_len] cond
+R 0 0 Jz [cond, bve_h_next]
+R 0 0 LoadByte [hbytes_ptr, j] b
+R 0 0 Add [h_abs, j] dst
+R 0 0 Call [elf_emit_at, dst, b]
+R 0 0 Add [j, 1] j
+R 0 0 Jmp [bve_h_excopy]
+R 0 0 Label [bve_h_normal]
+# Normal handler: copia bytes + jmp back a dispatch.
+R 0 0 Add [0, 0] j
+R 0 0 Label [bve_h_ncopy]
+R 0 0 Lt [j, hbytes_len] cond
+R 0 0 Jz [cond, bve_h_njmp]
+R 0 0 LoadByte [hbytes_ptr, j] b
+R 0 0 Add [h_abs, j] dst
+R 0 0 Call [elf_emit_at, dst, b]
+R 0 0 Add [j, 1] j
+R 0 0 Jmp [bve_h_ncopy]
+R 0 0 Label [bve_h_njmp]
+R 0 0 Add [h_abs, hbytes_len] jmp_pos
+R 0 0 Add [jmp_pos, jb_size] jmp_post
+R 0 0 Sub [dloop_abs, jmp_post] disp_j
+R 0 0 Call [arch_emit_jmp_back, jmp_pos, disp_j]
+R 0 0 Label [bve_h_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [bve_h_loop]
+R 0 0 Label [bve_h_done]
+# Tail
+R 0 0 Call [arch_emit_tail, tail_abs]
+# Jump table: abs addrs to handlers.
+R 0 0 Add [0, 0] i
+R 0 0 Label [bve_jt_loop]
+R 0 0 Lt [i, c_NUM_OPCODES] cond
+R 0 0 Jz [cond, bve_jt_done]
+R 0 0 Mul [i, 8] ioff
+R 0 0 LoadI64 [elf_handler_offsets, ioff] h_off
+R 0 0 Add [base_vaddr_v, vm_base] tmp2
+R 0 0 Add [tmp2, h_off] abs_addr
+R 0 0 Mul [i, jte_bytes] jtidx_off
+R 0 0 Add [vm_base, jt_offset] jtbase
+R 0 0 Add [jtbase, jtidx_off] jt_pos
+R 0 0 Call [elf_emit_u64_at, jt_pos, abs_addr]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [bve_jt_loop]
+R 0 0 Label [bve_jt_done]
+# Bytecode copy
+R 0 0 Add [0, 0] i
+R 0 0 Label [bve_bc_loop]
+R 0 0 Lt [i, g_bytecode_len] cond
+R 0 0 Jz [cond, bve_bc_done]
+R 0 0 LoadByte [g_bytecode, i] b
+R 0 0 Add [vm_base, bc_offset] bc_base
+R 0 0 Add [bc_base, i] dst
+R 0 0 Call [elf_emit_at, dst, b]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [bve_bc_loop]
+R 0 0 Label [bve_bc_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# ============================================================================
+# F.11 m_parser_d - compile_line_D (paralelo compilador_777.c 1852-1968)
+# ============================================================================
+# Procesa "D <id> <id> <name> Integer <val>" o "D ... Text \"...\"".
+# Asume parse_pos esta tras 'D'. Avanza hasta despues '\n'.
+
+D 0 0 c_kind_Integer Text "Integer\0"
+D 0 0 c_kind_Text Text "Text\0"
+
+F 0 0 compile_line_D [end]
+R 0 0 Add [parse_pos, 0] line_end
+R 0 0 Label [cld_find_eol]
+R 0 0 Lt [line_end, end] cond
+R 0 0 Jz [cond, cld_eol_done]
+R 0 0 LoadByte [g_source, line_end] cc
+R 0 0 Eq [cc, 10] is_nl
+R 0 0 Jz [is_nl, cld_eol_inc]
+R 0 0 Jmp [cld_eol_done]
+R 0 0 Label [cld_eol_inc]
+R 0 0 Add [line_end, 1] line_end
+R 0 0 Jmp [cld_find_eol]
+R 0 0 Label [cld_eol_done]
+# id1
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, cld_tok2]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_tok2]
+# id2
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, cld_tok3]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_tok3]
+# name
+R 0 0 Call [next_token, line_end]
+R 0 0 Call [is_valid_ident_at, g_tok_off, g_tok_len] is_id
+R 0 0 Jz [is_id, cld_skip]
+R 0 0 Label [cld_intern]
+R 0 0 Add [g_source, g_tok_off] name_ptr
+R 0 0 Call [sym_intern, name_ptr, g_tok_len] slot
+R 0 0 Lt [slot, 0] bad_slot
+R 0 0 Jz [bad_slot, cld_type]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_type]
+# type token
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, cld_chk_text]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_chk_text]
+R 0 0 Call [eq_str_lit, g_tok_off, g_tok_len, c_kind_Text] is_text
+R 0 0 Jz [is_text, cld_integer]
+# Text path: next token = quoted string.
+R 0 0 Call [next_token, line_end]
+R 0 0 Lt [g_tok_len, 2] too_short
+R 0 0 Jz [too_short, cld_text_check]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_text_check]
+R 0 0 LoadByte [g_source, g_tok_off] b0
+R 0 0 Eq [b0, 34] open_q
+R 0 0 Jz [open_q, cld_skip]
+R 0 0 Sub [g_tok_len, 1] last_idx
+R 0 0 Add [g_tok_off, last_idx] last_pos
+R 0 0 LoadByte [g_source, last_pos] b_last
+R 0 0 Eq [b_last, 34] close_q
+R 0 0 Jz [close_q, cld_skip]
+# Procesar escapes raw[1..len-1] -> str_tmp
+R 0 0 Add [g_tok_off, 1] raw_off
+R 0 0 Sub [g_tok_len, 2] content_len
+R 0 0 Add [0, 0] i
+R 0 0 Add [0, 0] j
+R 0 0 Label [cld_esc_loop]
+R 0 0 Lt [i, content_len] cond
+R 0 0 Jz [cond, cld_esc_done]
+R 0 0 Add [raw_off, i] ri
+R 0 0 LoadByte [g_source, ri] b
+R 0 0 Eq [b, 92] is_bs
+R 0 0 Jz [is_bs, cld_lit]
+R 0 0 Add [i, 1] inext
+R 0 0 Lt [inext, content_len] has_next
+R 0 0 Jz [has_next, cld_lit]
+R 0 0 Add [raw_off, inext] r_esc
+R 0 0 LoadByte [g_source, r_esc] esc
+R 0 0 Eq [esc, 110] is_n
+R 0 0 Jz [is_n, cld_chk_t]
+R 0 0 StoreByte [str_tmp, j, 10]
+R 0 0 Jmp [cld_esc_adv]
+R 0 0 Label [cld_chk_t]
+R 0 0 Eq [esc, 116] is_t
+R 0 0 Jz [is_t, cld_chk_bs]
+R 0 0 StoreByte [str_tmp, j, 9]
+R 0 0 Jmp [cld_esc_adv]
+R 0 0 Label [cld_chk_bs]
+R 0 0 Eq [esc, 92] is_bb
+R 0 0 Jz [is_bb, cld_chk_quo]
+R 0 0 StoreByte [str_tmp, j, 92]
+R 0 0 Jmp [cld_esc_adv]
+R 0 0 Label [cld_chk_quo]
+R 0 0 Eq [esc, 34] is_q
+R 0 0 Jz [is_q, cld_chk_zero]
+R 0 0 StoreByte [str_tmp, j, 34]
+R 0 0 Jmp [cld_esc_adv]
+R 0 0 Label [cld_chk_zero]
+R 0 0 Eq [esc, 48] is_z
+R 0 0 Jz [is_z, cld_chk_r]
+R 0 0 StoreByte [str_tmp, j, 0]
+R 0 0 Jmp [cld_esc_adv]
+R 0 0 Label [cld_chk_r]
+R 0 0 Eq [esc, 114] is_r
+R 0 0 Jz [is_r, cld_skip]
+R 0 0 StoreByte [str_tmp, j, 13]
+R 0 0 Jmp [cld_esc_adv]
+R 0 0 Label [cld_esc_adv]
+R 0 0 Add [j, 1] j
+R 0 0 Add [i, 2] i
+R 0 0 Jmp [cld_esc_loop]
+R 0 0 Label [cld_lit]
+R 0 0 StoreByte [str_tmp, j, b]
+R 0 0 Add [j, 1] j
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [cld_esc_loop]
+R 0 0 Label [cld_esc_done]
+R 0 0 Call [str_intern, str_tmp, j] data_off
+R 0 0 Lt [data_off, 0] err_intern
+R 0 0 Jz [err_intern, cld_text_emit]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_text_emit]
+R 0 0 Call [bc_emit, 22]
+R 0 0 Add [g_bytecode_len, 0] fixup_pos
+R 0 0 Call [bc_emit_imm64, 0]
+R 0 0 Call [str_add_fixup, fixup_pos, data_off] af_r
+R 0 0 Eq [af_r, 0] ok
+R 0 0 Jz [ok, cld_skip]
+R 0 0 Call [bc_emit, 7]
+R 0 0 Call [bc_emit_slot, slot]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_integer]
+# Integer path: next token = numero.
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, cld_int_parse]
+R 0 0 Jmp [cld_skip]
+R 0 0 Label [cld_int_parse]
+R 0 0 Call [parse_i64_at, g_tok_off, g_tok_len] val
+R 0 0 Eq [g_parse_err, 0] ok
+R 0 0 Jz [ok, cld_skip]
+R 0 0 Label [cld_int_emit]
+R 0 0 Call [fits_in_i32, val] is32
+R 0 0 Jz [is32, cld_int_64]
+R 0 0 Call [bc_emit, 1]
+R 0 0 Call [bc_emit_imm32, val]
+R 0 0 Jmp [cld_int_store]
+R 0 0 Label [cld_int_64]
+R 0 0 Call [bc_emit, 22]
+R 0 0 Call [bc_emit_imm64, val]
+R 0 0 Label [cld_int_store]
+R 0 0 Call [bc_emit, 7]
+R 0 0 Call [bc_emit_slot, slot]
+R 0 0 Label [cld_skip]
+R 0 0 Call [skip_to_eol, end]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# ============================================================================
+# F.12 m_parser_f - compile_line_F (paralelo compilador_777.c 1975-2050)
+# ============================================================================
+F 0 0 compile_line_F [end]
+# Fallback Sub-G: si F previa abierta, patchearla ahora antes de abrir nueva.
+R 0 0 Lt [pending_fn_jmp_pos, 0] no_pending
+R 0 0 Jz [no_pending, clf_patch_prev]
+R 0 0 Jmp [clf_after_patch]
+R 0 0 Label [clf_patch_prev]
+R 0 0 Add [pending_fn_jmp_pos, 2] post
+R 0 0 Sub [g_bytecode_len, post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 StoreByte [g_bytecode, pending_fn_jmp_pos, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 BitAnd [rs, 255] rb1
+R 0 0 Add [pending_fn_jmp_pos, 1] pos1
+R 0 0 StoreByte [g_bytecode, pos1, rb1]
+R 0 0 Add [-1, 0] pending_fn_jmp_pos
+R 0 0 Label [clf_after_patch]
+R 0 0 Add [-1, 0] pending_fn_slot
+# Sub-C reciclaje: restaurar sym_count tras cerrar F previa (fallback sin EndF).
+R 0 0 Lt [0, fn_slot_alloc_start] has_snap
+R 0 0 Jz [has_snap, clf_no_recycle]
+R 0 0 Add [fn_slot_alloc_start, 0] sym_count
+R 0 0 Add [0, 0] fn_slot_alloc_start
+R 0 0 Label [clf_no_recycle]
+# Find line_end
+R 0 0 Add [parse_pos, 0] line_end
+R 0 0 Label [clf_find_eol]
+R 0 0 Lt [line_end, end] cond
+R 0 0 Jz [cond, clf_eol_done]
+R 0 0 LoadByte [g_source, line_end] cc
+R 0 0 Eq [cc, 10] is_nl
+R 0 0 Jz [is_nl, clf_eol_inc]
+R 0 0 Jmp [clf_eol_done]
+R 0 0 Label [clf_eol_inc]
+R 0 0 Add [line_end, 1] line_end
+R 0 0 Jmp [clf_find_eol]
+R 0 0 Label [clf_eol_done]
+# Skip ws
+R 0 0 Label [clf_skip_ws1]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_skip_row]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] is_sp
+R 0 0 Jz [is_sp, clf_chk_t1]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_skip_ws1]
+R 0 0 Label [clf_chk_t1]
+R 0 0 Eq [cc, 9] is_t
+R 0 0 Jz [is_t, clf_skip_row]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_skip_ws1]
+R 0 0 Label [clf_skip_row]
+# Skip row digits
+R 0 0 Label [clf_row_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_skip_ws2]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Lt [cc, 48] lo
+R 0 0 Jz [lo, clf_row_chk_hi]
+R 0 0 Jmp [clf_skip_ws2]
+R 0 0 Label [clf_row_chk_hi]
+R 0 0 Gt [cc, 57] hi
+R 0 0 Jz [hi, clf_row_adv]
+R 0 0 Jmp [clf_skip_ws2]
+R 0 0 Label [clf_row_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_row_loop]
+R 0 0 Label [clf_skip_ws2]
+R 0 0 Label [clf_skip_ws2_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_skip_col]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] is_sp
+R 0 0 Jz [is_sp, clf_chk_t2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_skip_ws2_loop]
+R 0 0 Label [clf_chk_t2]
+R 0 0 Eq [cc, 9] is_t
+R 0 0 Jz [is_t, clf_skip_col]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_skip_ws2_loop]
+R 0 0 Label [clf_skip_col]
+# Skip col digits
+R 0 0 Label [clf_col_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_skip_ws3]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Lt [cc, 48] lo
+R 0 0 Jz [lo, clf_col_chk_hi]
+R 0 0 Jmp [clf_skip_ws3]
+R 0 0 Label [clf_col_chk_hi]
+R 0 0 Gt [cc, 57] hi
+R 0 0 Jz [hi, clf_col_adv]
+R 0 0 Jmp [clf_skip_ws3]
+R 0 0 Label [clf_col_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_col_loop]
+R 0 0 Label [clf_skip_ws3]
+R 0 0 Label [clf_skip_ws3_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_parse_name]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] is_sp
+R 0 0 Jz [is_sp, clf_chk_t3]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_skip_ws3_loop]
+R 0 0 Label [clf_chk_t3]
+R 0 0 Eq [cc, 9] is_t
+R 0 0 Jz [is_t, clf_parse_name]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_skip_ws3_loop]
+R 0 0 Label [clf_parse_name]
+# Parse name hasta ws o '['
+R 0 0 Add [parse_pos, 0] name_start
+R 0 0 Label [clf_name_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_name_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s1
+R 0 0 Jz [s1, clf_n_t]
+R 0 0 Jmp [clf_name_done]
+R 0 0 Label [clf_n_t]
+R 0 0 Eq [cc, 9] s2
+R 0 0 Jz [s2, clf_n_b]
+R 0 0 Jmp [clf_name_done]
+R 0 0 Label [clf_n_b]
+R 0 0 Eq [cc, 91] s3
+R 0 0 Jz [s3, clf_n_adv]
+R 0 0 Jmp [clf_name_done]
+R 0 0 Label [clf_n_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_name_loop]
+R 0 0 Label [clf_name_done]
+R 0 0 Sub [parse_pos, name_start] nlen
+R 0 0 Lt [0, nlen] valid
+R 0 0 Jz [valid, clf_skip]
+R 0 0 Add [g_source, name_start] name_ptr
+R 0 0 Call [func_lookup_or_create, name_ptr, nlen] slot
+R 0 0 Lt [slot, 0] bad
+R 0 0 Jz [bad, clf_activate]
+R 0 0 Jmp [clf_skip]
+R 0 0 Label [clf_activate]
+# Activate scope local Sub-C ANTES de parse params (params seran locales)
+R 0 0 Add [slot, 0] pending_fn_slot
+# Sub-C reciclaje: snapshot sym_count para restaurar al cerrar F
+R 0 0 Add [sym_count, 0] fn_slot_alloc_start
+# Parse params [p1,p2,...]
+R 0 0 Mul [slot, c_MAX_PARAMS_PER_FN] param_base
+R 0 0 Add [0, 0] param_count
+R 0 0 Label [clf_p_skip_ws]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_emit_jmp]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s1
+R 0 0 Jz [s1, clf_p_t]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_skip_ws]
+R 0 0 Label [clf_p_t]
+R 0 0 Eq [cc, 9] s2
+R 0 0 Jz [s2, clf_p_chk_br]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_skip_ws]
+R 0 0 Label [clf_p_chk_br]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_emit_jmp]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, clf_emit_jmp]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Label [clf_p_loop]
+R 0 0 Label [clf_p_inner_ws]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_p_emit]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s1
+R 0 0 Jz [s1, clf_p_iws_t]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_inner_ws]
+R 0 0 Label [clf_p_iws_t]
+R 0 0 Eq [cc, 9] s2
+R 0 0 Jz [s2, clf_p_chk_close]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_inner_ws]
+R 0 0 Label [clf_p_chk_close]
+R 0 0 Eq [cc, 93] is_close
+R 0 0 Jz [is_close, clf_p_pname]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_emit]
+R 0 0 Label [clf_p_pname]
+# Parse param name hasta ws/coma/']'
+R 0 0 Add [parse_pos, 0] pname_start
+R 0 0 Label [clf_p_nloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_p_intern]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, clf_p_chk_t]
+R 0 0 Jmp [clf_p_intern]
+R 0 0 Label [clf_p_chk_t]
+R 0 0 Eq [cc, 9] s
+R 0 0 Jz [s, clf_p_chk_co]
+R 0 0 Jmp [clf_p_intern]
+R 0 0 Label [clf_p_chk_co]
+R 0 0 Eq [cc, 44] s
+R 0 0 Jz [s, clf_p_chk_clb]
+R 0 0 Jmp [clf_p_intern]
+R 0 0 Label [clf_p_chk_clb]
+R 0 0 Eq [cc, 93] s
+R 0 0 Jz [s, clf_p_n_adv]
+R 0 0 Jmp [clf_p_intern]
+R 0 0 Label [clf_p_n_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_nloop]
+R 0 0 Label [clf_p_intern]
+R 0 0 Sub [parse_pos, pname_start] plen
+R 0 0 Lt [0, plen] pvalid
+R 0 0 Jz [pvalid, clf_p_after]
+R 0 0 Lt [param_count, c_MAX_PARAMS_PER_FN] cap
+R 0 0 Jz [cap, clf_p_after]
+R 0 0 Add [g_source, pname_start] pname_ptr
+R 0 0 Call [sym_intern, pname_ptr, plen] param_sym
+R 0 0 Lt [param_sym, 0] bad_p
+R 0 0 Jz [bad_p, clf_p_save]
+R 0 0 Jmp [clf_p_after]
+R 0 0 Label [clf_p_save]
+R 0 0 Add [param_base, param_count] slot_idx
+R 0 0 Mul [slot_idx, 8] slot_off
+R 0 0 StoreI64 [function_params, slot_off, param_sym]
+R 0 0 Add [param_count, 1] param_count
+R 0 0 Label [clf_p_after]
+# skip ',' or ws to ']'
+R 0 0 Label [clf_p_seploop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, clf_p_loop]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] is_cl
+R 0 0 Jz [is_cl, clf_p_chk_comma]
+R 0 0 Jmp [clf_p_loop]
+R 0 0 Label [clf_p_chk_comma]
+R 0 0 Eq [cc, 44] is_c
+R 0 0 Jz [is_c, clf_p_chk_sp]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_loop]
+R 0 0 Label [clf_p_chk_sp]
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, clf_p_chk_tt]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_seploop]
+R 0 0 Label [clf_p_chk_tt]
+R 0 0 Eq [cc, 9] s
+R 0 0 Jz [s, clf_p_loop]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [clf_p_seploop]
+R 0 0 Label [clf_p_emit]
+R 0 0 Label [clf_emit_jmp]
+R 0 0 Mul [slot, 8] slot_o
+R 0 0 StoreI64 [function_param_count, slot_o, param_count]
+# Emit OP_JMP placeholder + reservar fixup
+R 0 0 Call [bc_emit, 8]
+R 0 0 Add [g_bytecode_len, 0] pending_fn_jmp_pos
+R 0 0 Add [slot, 0] pending_fn_slot
+R 0 0 Call [bc_emit, 0]
+R 0 0 Call [bc_emit, 0]
+R 0 0 StoreI64 [function_offsets, slot_o, g_bytecode_len]
+# Auto-pop ret_addr a slot UNICO de F (Sub-B). Lote 4: ret_addr_slot >= 256 puede ocurrir
+R 0 0 Call [bc_emit, 7]
+R 0 0 Add [c_RET_ADDR_BASE, slot] ret_addr_slot
+R 0 0 Call [bc_emit_slot, ret_addr_slot]
+# Auto-pop params en orden inverso (Sub-A)
+R 0 0 Lt [0, param_count] hp
+R 0 0 Jz [hp, clf_done_pop]
+R 0 0 Sub [param_count, 1] i
+R 0 0 Label [clf_pop_loop]
+R 0 0 Lt [i, 0] done
+R 0 0 Jz [done, clf_do_pop]
+R 0 0 Jmp [clf_done_pop]
+R 0 0 Label [clf_do_pop]
+R 0 0 Add [param_base, i] sl_idx
+R 0 0 Mul [sl_idx, 8] sl_off
+R 0 0 LoadI64 [function_params, sl_off] psym
+R 0 0 Call [bc_emit, 7]
+R 0 0 Call [bc_emit_slot, psym]
+R 0 0 Sub [i, 1] i
+R 0 0 Jmp [clf_pop_loop]
+R 0 0 Label [clf_done_pop]
+R 0 0 Label [clf_skip]
+R 0 0 Call [skip_to_eol, end]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# ============================================================================
+# F.10 m_parser_r - compile_line_R (paralelo compilador_777.c 1238-1849)
+# ============================================================================
+# Procesa "R <id> <id> <kind> [args] [output]\n". Maneja Label, Jmp, Jz,
+# ExitTop, Call, Ret, EndF como kinds especiales; resto via opcode_from_kind.
+# Diseno: helpers handle_* definidos ANTES de compile_line_R (M2-Planet
+# style: no forward decl). compile_line_R hace dispatch.
+
+D 0 0 c_kind_Label Text "Label\0"
+D 0 0 c_kind_Jmp Text "Jmp\0"
+D 0 0 c_kind_Jz Text "Jz\0"
+D 0 0 c_kind_ExitTop Text "ExitTop\0"
+D 0 0 c_kind_Call Text "Call\0"
+D 0 0 c_kind_Ret Text "Ret\0"
+D 0 0 c_kind_EndF Text "EndF\0"
+
+# Skip ws+tab desde parse_pos hasta line_end.
+F 0 0 clr_skip_ws [line_end]
+R 0 0 Label [csw_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, csw_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s1
+R 0 0 Jz [s1, csw_chk_t]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [csw_loop]
+R 0 0 Label [csw_chk_t]
+R 0 0 Eq [cc, 9] s2
+R 0 0 Jz [s2, csw_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [csw_loop]
+R 0 0 Label [csw_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Parse 1 arg hasta delim (espacio/tab/coma/']'). Setea g_tok_off/g_tok_len.
+F 0 0 clr_parse_arg_token [line_end]
+R 0 0 Add [parse_pos, 0] start
+R 0 0 Label [cpa_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, cpa_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s1
+R 0 0 Jz [s1, cpa_t]
+R 0 0 Jmp [cpa_done]
+R 0 0 Label [cpa_t]
+R 0 0 Eq [cc, 9] s2
+R 0 0 Jz [s2, cpa_co]
+R 0 0 Jmp [cpa_done]
+R 0 0 Label [cpa_co]
+R 0 0 Eq [cc, 44] s3
+R 0 0 Jz [s3, cpa_cl]
+R 0 0 Jmp [cpa_done]
+R 0 0 Label [cpa_cl]
+R 0 0 Eq [cc, 93] s4
+R 0 0 Jz [s4, cpa_adv]
+R 0 0 Jmp [cpa_done]
+R 0 0 Label [cpa_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [cpa_loop]
+R 0 0 Label [cpa_done]
+R 0 0 Add [start, 0] g_tok_off
+R 0 0 Sub [parse_pos, start] g_tok_len
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R Label [name]
+F 0 0 clr_handle_Label [end, line_end]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, hl_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, hl_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Add [parse_pos, 0] lbl_start
+R 0 0 Label [hl_nloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hl_nend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] s1
+R 0 0 Jz [s1, hl_t]
+R 0 0 Jmp [hl_nend]
+R 0 0 Label [hl_t]
+R 0 0 Eq [cc, 32] s2
+R 0 0 Jz [s2, hl_tt]
+R 0 0 Jmp [hl_nend]
+R 0 0 Label [hl_tt]
+R 0 0 Eq [cc, 9] s3
+R 0 0 Jz [s3, hl_adv]
+R 0 0 Jmp [hl_nend]
+R 0 0 Label [hl_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hl_nloop]
+R 0 0 Label [hl_nend]
+R 0 0 Sub [parse_pos, lbl_start] lbl_len
+R 0 0 Lt [0, lbl_len] valid
+R 0 0 Jz [valid, hl_done]
+R 0 0 Add [g_source, lbl_start] lbl_ptr
+R 0 0 Call [label_lookup_or_create, lbl_ptr, lbl_len] lbl_slot
+R 0 0 Lt [lbl_slot, 0] bad
+R 0 0 Jz [bad, hl_set]
+R 0 0 Jmp [hl_done]
+R 0 0 Label [hl_set]
+R 0 0 Mul [lbl_slot, 8] sl_off
+R 0 0 StoreI64 [label_offsets, sl_off, g_bytecode_len]
+R 0 0 Label [hl_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R Jmp [rel|name]
+F 0 0 clr_handle_Jmp [end, line_end]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, hj_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, hj_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Add [parse_pos, 0] arg_start
+R 0 0 Label [hj_aloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hj_aend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] s1
+R 0 0 Jz [s1, hj_t]
+R 0 0 Jmp [hj_aend]
+R 0 0 Label [hj_t]
+R 0 0 Eq [cc, 32] s2
+R 0 0 Jz [s2, hj_adv]
+R 0 0 Jmp [hj_aend]
+R 0 0 Label [hj_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hj_aloop]
+R 0 0 Label [hj_aend]
+R 0 0 Sub [parse_pos, arg_start] alen
+R 0 0 Call [parse_i64_at, arg_start, alen] rel
+R 0 0 Call [bc_emit, 8]
+R 0 0 Eq [g_parse_err, 0] ok
+R 0 0 Jz [ok, hj_label]
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 Call [bc_emit, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 Call [bc_emit, rs]
+R 0 0 Jmp [hj_done]
+R 0 0 Label [hj_label]
+R 0 0 Add [g_source, arg_start] aptr
+R 0 0 Call [label_lookup_or_create, aptr, alen] lsl
+R 0 0 Lt [lsl, 0] bad
+R 0 0 Jz [bad, hj_lok]
+R 0 0 Jmp [hj_done]
+R 0 0 Label [hj_lok]
+R 0 0 Mul [lsl, 8] loff
+R 0 0 LoadI64 [label_offsets, loff] toff
+R 0 0 Lt [toff, 0] undef
+R 0 0 Jz [undef, hj_resolve]
+R 0 0 Call [label_add_fixup, g_bytecode_len, lsl] _
+R 0 0 Call [bc_emit, 0]
+R 0 0 Call [bc_emit, 0]
+R 0 0 Jmp [hj_done]
+R 0 0 Label [hj_resolve]
+R 0 0 Add [g_bytecode_len, 2] post
+R 0 0 Sub [toff, post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 Call [bc_emit, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 Call [bc_emit, rs]
+R 0 0 Label [hj_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R Jz [cond, rel|name]
+F 0 0 clr_handle_Jz [end, line_end]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, hz_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, hz_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [clr_skip_ws, line_end]
+# arg1: cond hasta ','
+R 0 0 Add [parse_pos, 0] a1_start
+R 0 0 Label [hz_a1l]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hz_a1e]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 44] cm
+R 0 0 Jz [cm, hz_chk_sp]
+R 0 0 Jmp [hz_a1e]
+R 0 0 Label [hz_chk_sp]
+R 0 0 Eq [cc, 32] sp
+R 0 0 Jz [sp, hz_adv1]
+R 0 0 Jmp [hz_a1e]
+R 0 0 Label [hz_adv1]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hz_a1l]
+R 0 0 Label [hz_a1e]
+R 0 0 Sub [parse_pos, a1_start] a1_len
+R 0 0 Call [emit_load_arg_at, a1_start, a1_len] er
+R 0 0 Eq [er, 0] ok
+R 0 0 Jz [ok, hz_done]
+# skip ws+coma
+R 0 0 Label [hz_sep]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hz_a2]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 44] is_c
+R 0 0 Jz [is_c, hz_chk_ws]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hz_a2]
+R 0 0 Label [hz_chk_ws]
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, hz_chk_t]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hz_sep]
+R 0 0 Label [hz_chk_t]
+R 0 0 Eq [cc, 9] s
+R 0 0 Jz [s, hz_a2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hz_sep]
+R 0 0 Label [hz_a2]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Add [parse_pos, 0] a2_start
+R 0 0 Label [hz_a2l]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hz_a2e]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] s1
+R 0 0 Jz [s1, hz_t2]
+R 0 0 Jmp [hz_a2e]
+R 0 0 Label [hz_t2]
+R 0 0 Eq [cc, 32] s2
+R 0 0 Jz [s2, hz_adv2]
+R 0 0 Jmp [hz_a2e]
+R 0 0 Label [hz_adv2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hz_a2l]
+R 0 0 Label [hz_a2e]
+R 0 0 Sub [parse_pos, a2_start] a2_len
+R 0 0 Call [parse_i64_at, a2_start, a2_len] rel
+R 0 0 Call [bc_emit, 9]
+R 0 0 Eq [g_parse_err, 0] ok
+R 0 0 Jz [ok, hz_label]
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 Call [bc_emit, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 Call [bc_emit, rs]
+R 0 0 Jmp [hz_done]
+R 0 0 Label [hz_label]
+R 0 0 Add [g_source, a2_start] aptr
+R 0 0 Call [label_lookup_or_create, aptr, a2_len] lsl
+R 0 0 Lt [lsl, 0] bad
+R 0 0 Jz [bad, hz_lok]
+R 0 0 Jmp [hz_done]
+R 0 0 Label [hz_lok]
+R 0 0 Mul [lsl, 8] loff
+R 0 0 LoadI64 [label_offsets, loff] toff
+R 0 0 Lt [toff, 0] undef
+R 0 0 Jz [undef, hz_resolve]
+R 0 0 Call [label_add_fixup, g_bytecode_len, lsl] _
+R 0 0 Call [bc_emit, 0]
+R 0 0 Call [bc_emit, 0]
+R 0 0 Jmp [hz_done]
+R 0 0 Label [hz_resolve]
+R 0 0 Add [g_bytecode_len, 2] post
+R 0 0 Sub [toff, post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 Call [bc_emit, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 Call [bc_emit, rs]
+R 0 0 Label [hz_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R ExitTop [val]
+F 0 0 clr_handle_ExitTop [end, line_end]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, het_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, het_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Add [parse_pos, 0] arg_start
+R 0 0 Label [het_aloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, het_aend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] s1
+R 0 0 Jz [s1, het_t]
+R 0 0 Jmp [het_aend]
+R 0 0 Label [het_t]
+R 0 0 Eq [cc, 32] s2
+R 0 0 Jz [s2, het_adv]
+R 0 0 Jmp [het_aend]
+R 0 0 Label [het_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [het_aloop]
+R 0 0 Label [het_aend]
+R 0 0 Sub [parse_pos, arg_start] alen
+R 0 0 Call [emit_load_arg_at, arg_start, alen] er
+R 0 0 Eq [er, 0] ok
+R 0 0 Jz [ok, het_done]
+R 0 0 Call [bc_emit, 19]
+R 0 0 Label [het_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R Call [target, args...] result?
+F 0 0 clr_handle_Call [end, line_end]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, hc_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, hc_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [clr_skip_ws, line_end]
+# Parse target
+R 0 0 Add [parse_pos, 0] target_start
+R 0 0 Label [hc_tloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hc_tend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] s1
+R 0 0 Jz [s1, hc_chk_s]
+R 0 0 Jmp [hc_tend]
+R 0 0 Label [hc_chk_s]
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, hc_chk_t]
+R 0 0 Jmp [hc_tend]
+R 0 0 Label [hc_chk_t]
+R 0 0 Eq [cc, 9] s
+R 0 0 Jz [s, hc_chk_co]
+R 0 0 Jmp [hc_tend]
+R 0 0 Label [hc_chk_co]
+R 0 0 Eq [cc, 44] s
+R 0 0 Jz [s, hc_t_adv]
+R 0 0 Jmp [hc_tend]
+R 0 0 Label [hc_t_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_tloop]
+R 0 0 Label [hc_tend]
+R 0 0 Sub [parse_pos, target_start] target_len
+R 0 0 Lt [0, target_len] tval
+R 0 0 Jz [tval, hc_done]
+# Loop args
+R 0 0 Label [hc_args_loop]
+R 0 0 Label [hc_args_sep]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hc_emit_call]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] is_close
+R 0 0 Jz [is_close, hc_chk_s2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_emit_call]
+R 0 0 Label [hc_chk_s2]
+R 0 0 Eq [cc, 32] is_s
+R 0 0 Jz [is_s, hc_chk_t2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_args_sep]
+R 0 0 Label [hc_chk_t2]
+R 0 0 Eq [cc, 9] is_t
+R 0 0 Jz [is_t, hc_chk_co2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_args_sep]
+R 0 0 Label [hc_chk_co2]
+R 0 0 Eq [cc, 44] is_co
+R 0 0 Jz [is_co, hc_parse_arg]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_args_sep]
+R 0 0 Label [hc_parse_arg]
+R 0 0 Add [parse_pos, 0] arg_start
+R 0 0 Label [hc_aloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hc_aend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, hc_a_t]
+R 0 0 Jmp [hc_aend]
+R 0 0 Label [hc_a_t]
+R 0 0 Eq [cc, 9] s
+R 0 0 Jz [s, hc_a_co]
+R 0 0 Jmp [hc_aend]
+R 0 0 Label [hc_a_co]
+R 0 0 Eq [cc, 44] s
+R 0 0 Jz [s, hc_a_cl]
+R 0 0 Jmp [hc_aend]
+R 0 0 Label [hc_a_cl]
+R 0 0 Eq [cc, 93] s
+R 0 0 Jz [s, hc_a_adv]
+R 0 0 Jmp [hc_aend]
+R 0 0 Label [hc_a_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_aloop]
+R 0 0 Label [hc_aend]
+R 0 0 Sub [parse_pos, arg_start] arg_len
+R 0 0 Lt [0, arg_len] avalid
+R 0 0 Jz [avalid, hc_args_sep]
+R 0 0 Call [emit_load_arg_at, arg_start, arg_len] er
+R 0 0 Eq [er, 0] ok
+R 0 0 Jz [ok, hc_done]
+R 0 0 Jmp [hc_args_sep]
+R 0 0 Label [hc_emit_call]
+# Emit OP_CALL + rel
+R 0 0 Call [parse_i64_at, target_start, target_len] rel_v
+R 0 0 Call [bc_emit, 29]
+R 0 0 Eq [g_parse_err, 0] ok
+R 0 0 Jz [ok, hc_id_target]
+R 0 0 BitAnd [rel_v, 255] rb0
+R 0 0 Call [bc_emit, rb0]
+R 0 0 Shr [rel_v, 8] rs
+R 0 0 Call [bc_emit, rs]
+R 0 0 Jmp [hc_done]
+R 0 0 Label [hc_id_target]
+R 0 0 Add [g_source, target_start] tptr
+R 0 0 Call [func_lookup_or_create, tptr, target_len] call_slot
+R 0 0 Lt [call_slot, 0] bad
+R 0 0 Jz [bad, hc_call_ok]
+R 0 0 Jmp [hc_done]
+R 0 0 Label [hc_call_ok]
+R 0 0 Mul [call_slot, 8] csoff
+R 0 0 LoadI64 [function_offsets, csoff] foff
+R 0 0 Lt [foff, 0] undef
+R 0 0 Jz [undef, hc_call_resolve]
+R 0 0 Call [func_add_fixup, g_bytecode_len, call_slot] _
+R 0 0 Call [bc_emit, 0]
+R 0 0 Call [bc_emit, 0]
+R 0 0 Jmp [hc_result]
+R 0 0 Label [hc_call_resolve]
+R 0 0 Add [g_bytecode_len, 2] cpost
+R 0 0 Sub [foff, cpost] crel
+R 0 0 BitAnd [crel, 255] rb0
+R 0 0 Call [bc_emit, rb0]
+R 0 0 Shr [crel, 8] rs
+R 0 0 Call [bc_emit, rs]
+R 0 0 Label [hc_result]
+# Parse result slot post-]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Add [parse_pos, 0] result_start
+R 0 0 Label [hc_r_loop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hc_r_end]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] s1
+R 0 0 Jz [s1, hc_r_t]
+R 0 0 Jmp [hc_r_end]
+R 0 0 Label [hc_r_t]
+R 0 0 Eq [cc, 9] s2
+R 0 0 Jz [s2, hc_r_n]
+R 0 0 Jmp [hc_r_end]
+R 0 0 Label [hc_r_n]
+R 0 0 Eq [cc, 10] s3
+R 0 0 Jz [s3, hc_r_cr]
+R 0 0 Jmp [hc_r_end]
+R 0 0 Label [hc_r_cr]
+R 0 0 Eq [cc, 13] s4
+R 0 0 Jz [s4, hc_r_adv]
+R 0 0 Jmp [hc_r_end]
+R 0 0 Label [hc_r_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hc_r_loop]
+R 0 0 Label [hc_r_end]
+R 0 0 Sub [parse_pos, result_start] result_len
+R 0 0 Lt [0, result_len] hasres
+R 0 0 Jz [hasres, hc_drop]
+R 0 0 Add [g_source, result_start] rptr
+R 0 0 Call [sym_intern, rptr, result_len] rslot
+R 0 0 Lt [rslot, 0] bad_r
+R 0 0 Jz [bad_r, hc_emit_store]
+R 0 0 Jmp [hc_done]
+R 0 0 Label [hc_emit_store]
+R 0 0 Call [bc_emit, 7]
+R 0 0 Call [bc_emit_slot, rslot]
+R 0 0 Jmp [hc_done]
+R 0 0 Label [hc_drop]
+R 0 0 Call [bc_emit, 7]
+R 0 0 Call [bc_emit_slot, c_DROP_SLOT]
+R 0 0 Label [hc_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R Ret [val?]
+F 0 0 clr_handle_Ret [end, line_end]
+R 0 0 Lt [pending_fn_slot, 0] outside
+R 0 0 Jz [outside, hr_inside]
+R 0 0 Call [bc_emit, 30]
+R 0 0 Ret []
+R 0 0 Label [hr_inside]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Add [0, 0] ra_len
+R 0 0 Add [0, 0] ra_start
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, hr_emit_zero]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, hr_emit_zero]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Add [parse_pos, 0] ra_start
+R 0 0 Label [hr_aloop]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hr_aend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] s1
+R 0 0 Jz [s1, hr_t]
+R 0 0 Jmp [hr_aend]
+R 0 0 Label [hr_t]
+R 0 0 Eq [cc, 32] s2
+R 0 0 Jz [s2, hr_tt]
+R 0 0 Jmp [hr_aend]
+R 0 0 Label [hr_tt]
+R 0 0 Eq [cc, 9] s3
+R 0 0 Jz [s3, hr_adv]
+R 0 0 Jmp [hr_aend]
+R 0 0 Label [hr_adv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hr_aloop]
+R 0 0 Label [hr_aend]
+R 0 0 Sub [parse_pos, ra_start] ra_len
+R 0 0 Label [hr_emit_zero]
+R 0 0 Lt [0, ra_len] has_v
+R 0 0 Jz [has_v, hr_zero]
+R 0 0 Call [parse_i64_at, ra_start, ra_len] rv
+R 0 0 Eq [g_parse_err, 0] is_num
+R 0 0 Jz [is_num, hr_id]
+R 0 0 Call [bc_emit, 1]
+R 0 0 Call [bc_emit_imm32, rv]
+R 0 0 Jmp [hr_emit_ra]
+R 0 0 Label [hr_id]
+R 0 0 Add [g_source, ra_start] vptr
+R 0 0 Call [sym_intern, vptr, ra_len] rs
+R 0 0 Lt [rs, 0] bad
+R 0 0 Jz [bad, hr_id_ok]
+R 0 0 Ret []
+R 0 0 Label [hr_id_ok]
+R 0 0 Call [bc_emit, 6]
+R 0 0 Call [bc_emit_slot, rs]
+R 0 0 Jmp [hr_emit_ra]
+R 0 0 Label [hr_zero]
+R 0 0 Call [bc_emit, 1]
+R 0 0 Call [bc_emit_imm32, 0]
+R 0 0 Label [hr_emit_ra]
+R 0 0 Call [bc_emit, 6]
+R 0 0 Add [c_RET_ADDR_BASE, pending_fn_slot] ras
+R 0 0 Call [bc_emit_slot, ras]
+R 0 0 Call [bc_emit, 30]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler R EndF: patchea pending_fn_jmp_pos + reset pending_fn_*
+F 0 0 clr_handle_EndF [end, line_end]
+R 0 0 Lt [pending_fn_jmp_pos, 0] no_pending
+R 0 0 Jz [no_pending, hef_patch]
+R 0 0 Jmp [hef_reset_slot]
+R 0 0 Label [hef_patch]
+R 0 0 Add [pending_fn_jmp_pos, 2] post
+R 0 0 Sub [g_bytecode_len, post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 StoreByte [g_bytecode, pending_fn_jmp_pos, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 BitAnd [rs, 255] rb1
+R 0 0 Add [pending_fn_jmp_pos, 1] pos1
+R 0 0 StoreByte [g_bytecode, pos1, rb1]
+R 0 0 Add [-1, 0] pending_fn_jmp_pos
+R 0 0 Label [hef_reset_slot]
+R 0 0 Add [-1, 0] pending_fn_slot
+# Sub-C reciclaje: restaurar sym_count para liberar slots locales del F cerrado.
+R 0 0 Lt [0, fn_slot_alloc_start] has_snap
+R 0 0 Jz [has_snap, hef_no_recycle]
+R 0 0 Add [fn_slot_alloc_start, 0] sym_count
+R 0 0 Add [0, 0] fn_slot_alloc_start
+R 0 0 Label [hef_no_recycle]
+R 0 0 Ret []
+R 0 0 EndF
+
+# Handler generic kind: parse [args] + emit + output_var
+F 0 0 clr_handle_generic [end, line_end, op]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] in_line
+R 0 0 Jz [in_line, hg_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 91] is_open
+R 0 0 Jz [is_open, hg_done]
+R 0 0 Add [parse_pos, 1] parse_pos
+# Loop args
+R 0 0 Label [hg_loop]
+R 0 0 Call [clr_skip_ws, line_end]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hg_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 93] is_close
+R 0 0 Jz [is_close, hg_parse]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hg_emit_op]
+R 0 0 Label [hg_parse]
+R 0 0 Add [parse_pos, 0] arg_start
+R 0 0 Label [hg_atok]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hg_aend]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 44] s
+R 0 0 Jz [s, hg_chk_cl]
+R 0 0 Jmp [hg_aend]
+R 0 0 Label [hg_chk_cl]
+R 0 0 Eq [cc, 93] s
+R 0 0 Jz [s, hg_chk_sp]
+R 0 0 Jmp [hg_aend]
+R 0 0 Label [hg_chk_sp]
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, hg_aadv]
+R 0 0 Jmp [hg_aend]
+R 0 0 Label [hg_aadv]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hg_atok]
+R 0 0 Label [hg_aend]
+R 0 0 Sub [parse_pos, arg_start] alen
+R 0 0 Call [emit_load_arg_at, arg_start, alen] er
+R 0 0 Eq [er, 0] ok
+R 0 0 Jz [ok, hg_done]
+R 0 0 Label [hg_sep]
+R 0 0 Lt [parse_pos, line_end] cond
+R 0 0 Jz [cond, hg_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 44] is_co
+R 0 0 Jz [is_co, hg_chk_cl2]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hg_loop]
+R 0 0 Label [hg_chk_cl2]
+R 0 0 Eq [cc, 93] is_cl
+R 0 0 Jz [is_cl, hg_chk_ws]
+R 0 0 Jmp [hg_loop]
+R 0 0 Label [hg_chk_ws]
+R 0 0 Eq [cc, 32] s
+R 0 0 Jz [s, hg_chk_t]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hg_sep]
+R 0 0 Label [hg_chk_t]
+R 0 0 Eq [cc, 9] s
+R 0 0 Jz [s, hg_loop]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [hg_sep]
+R 0 0 Label [hg_emit_op]
+R 0 0 Call [bc_emit, op]
+# output_var if not void kind
+R 0 0 Call [is_void_kind, op] is_void
+R 0 0 Jz [is_void, hg_out]
+R 0 0 Jmp [hg_done]
+R 0 0 Label [hg_out]
+R 0 0 Call [next_token, line_end]
+R 0 0 Add [g_tok_off, 0] o_off
+R 0 0 Add [g_tok_len, 0] o_len
+R 0 0 Call [is_valid_ident_at, o_off, o_len] is_id
+R 0 0 Jz [is_id, hg_addr12]
+R 0 0 Add [g_source, o_off] optr
+R 0 0 Call [sym_intern, optr, o_len] oslot
+R 0 0 Lt [oslot, 0] bad
+R 0 0 Jz [bad, hg_emit_st]
+R 0 0 Jmp [hg_addr12]
+R 0 0 Label [hg_emit_st]
+R 0 0 Call [bc_emit, 7]
+R 0 0 Call [bc_emit_slot, oslot]
+R 0 0 Jmp [hg_done]
+R 0 0 Label [hg_addr12]
+R 0 0 Call [bc_emit, 5]
+R 0 0 Label [hg_done]
+R 0 0 Ret []
+R 0 0 EndF
+
+# compile_line_R: dispatch a clr_handle_* segun kind.
+F 0 0 compile_line_R [end]
+R 0 0 Add [parse_pos, 0] line_end
+R 0 0 Label [clr_eol]
+R 0 0 Lt [line_end, end] cond
+R 0 0 Jz [cond, clr_eold]
+R 0 0 LoadByte [g_source, line_end] cc
+R 0 0 Eq [cc, 10] is_nl
+R 0 0 Jz [is_nl, clr_eol_inc]
+R 0 0 Jmp [clr_eold]
+R 0 0 Label [clr_eol_inc]
+R 0 0 Add [line_end, 1] line_end
+R 0 0 Jmp [clr_eol]
+R 0 0 Label [clr_eold]
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, clr_tok2]
+R 0 0 Jmp [clr_skip]
+R 0 0 Label [clr_tok2]
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, clr_tok3]
+R 0 0 Jmp [clr_skip]
+R 0 0 Label [clr_tok3]
+R 0 0 Call [next_token, line_end]
+R 0 0 Eq [g_tok_len, 0] empty
+R 0 0 Jz [empty, clr_disp]
+R 0 0 Jmp [clr_skip]
+R 0 0 Label [clr_disp]
+R 0 0 Add [g_tok_off, 0] kind_off
+R 0 0 Add [g_tok_len, 0] klen
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_Label] m
+R 0 0 Jz [m, clr_chk_Jmp]
+R 0 0 Call [clr_handle_Label, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_chk_Jmp]
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_Jmp] m
+R 0 0 Jz [m, clr_chk_Jz]
+R 0 0 Call [clr_handle_Jmp, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_chk_Jz]
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_Jz] m
+R 0 0 Jz [m, clr_chk_ExitTop]
+R 0 0 Call [clr_handle_Jz, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_chk_ExitTop]
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_ExitTop] m
+R 0 0 Jz [m, clr_chk_Call]
+R 0 0 Call [clr_handle_ExitTop, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_chk_Call]
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_Call] m
+R 0 0 Jz [m, clr_chk_Ret]
+R 0 0 Call [clr_handle_Call, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_chk_Ret]
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_Ret] m
+R 0 0 Jz [m, clr_chk_EndF]
+R 0 0 Call [clr_handle_Ret, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_chk_EndF]
+R 0 0 Call [eq_str_lit, kind_off, klen, c_kind_EndF] m
+R 0 0 Jz [m, clr_generic]
+R 0 0 Call [clr_handle_EndF, end, line_end]
+R 0 0 Jmp [clr_end]
+R 0 0 Label [clr_generic]
+R 0 0 Call [opcode_from_kind_at, kind_off, klen] op
+R 0 0 Lt [op, 0] bad
+R 0 0 Jz [bad, clr_gen_ok]
+R 0 0 Jmp [clr_skip]
+R 0 0 Label [clr_gen_ok]
+R 0 0 Call [clr_handle_generic, end, line_end, op]
+R 0 0 Label [clr_end]
+R 0 0 Call [skip_to_eol, end]
+R 0 0 Ret [0]
+R 0 0 Label [clr_skip]
+R 0 0 Call [skip_to_eol, end]
+R 0 0 Ret [0]
+R 0 0 EndF
+
+# ============================================================================
+# F.13 m_main - orchestrator + main (paralelo compilador_777.c 2049-2202)
+# ============================================================================
+
+# compile_777m_to_bytecode: loop principal de parsing.
+F 0 0 compile_777m_to_bytecode []
+R 0 0 Add [0, 0] g_bytecode_len
+R 0 0 Add [0, 0] parse_pos
+R 0 0 Label [c777_loop]
+R 0 0 Label [c777_skip_ws]
+R 0 0 Lt [parse_pos, g_source_len] cond
+R 0 0 Jz [cond, c777_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 32] is_sp
+R 0 0 Jz [is_sp, c777_chk_t]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [c777_skip_ws]
+R 0 0 Label [c777_chk_t]
+R 0 0 Eq [cc, 9] is_t
+R 0 0 Jz [is_t, c777_chk_n]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [c777_skip_ws]
+R 0 0 Label [c777_chk_n]
+R 0 0 Eq [cc, 10] is_n
+R 0 0 Jz [is_n, c777_chk_r]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [c777_skip_ws]
+R 0 0 Label [c777_chk_r]
+R 0 0 Eq [cc, 13] is_r
+R 0 0 Jz [is_r, c777_dispatch]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Jmp [c777_skip_ws]
+R 0 0 Label [c777_dispatch]
+R 0 0 Lt [parse_pos, g_source_len] cond
+R 0 0 Jz [cond, c777_done]
+R 0 0 LoadByte [g_source, parse_pos] cc
+R 0 0 Eq [cc, 55] is_7
+R 0 0 Jz [is_7, c777_chk_F]
+R 0 0 Call [skip_to_eol, g_source_len]
+R 0 0 Jmp [c777_loop]
+R 0 0 Label [c777_chk_F]
+R 0 0 Eq [cc, 70] is_F
+R 0 0 Jz [is_F, c777_chk_C]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [compile_line_F, g_source_len]
+R 0 0 Jmp [c777_loop]
+R 0 0 Label [c777_chk_C]
+R 0 0 Eq [cc, 67] is_C
+R 0 0 Jz [is_C, c777_chk_D]
+R 0 0 Call [skip_to_eol, g_source_len]
+R 0 0 Jmp [c777_loop]
+R 0 0 Label [c777_chk_D]
+R 0 0 Eq [cc, 68] is_D
+R 0 0 Jz [is_D, c777_chk_R]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [compile_line_D, g_source_len]
+R 0 0 Jmp [c777_loop]
+R 0 0 Label [c777_chk_R]
+R 0 0 Eq [cc, 82] is_R
+R 0 0 Jz [is_R, c777_other]
+R 0 0 Add [parse_pos, 1] parse_pos
+R 0 0 Call [compile_line_R, g_source_len]
+R 0 0 Jmp [c777_loop]
+R 0 0 Label [c777_other]
+R 0 0 Call [skip_to_eol, g_source_len]
+R 0 0 Jmp [c777_loop]
+R 0 0 Label [c777_done]
+# Fallback EOF Sub-G: patch pending F si abierta
+R 0 0 Lt [pending_fn_jmp_pos, 0] no_pending
+R 0 0 Jz [no_pending, c777_eof_patch]
+R 0 0 Jmp [c777_after_eof]
+R 0 0 Label [c777_eof_patch]
+R 0 0 Add [pending_fn_jmp_pos, 2] post
+R 0 0 Sub [g_bytecode_len, post] rel
+R 0 0 BitAnd [rel, 255] rb0
+R 0 0 StoreByte [g_bytecode, pending_fn_jmp_pos, rb0]
+R 0 0 Shr [rel, 8] rs
+R 0 0 BitAnd [rs, 255] rb1
+R 0 0 Add [pending_fn_jmp_pos, 1] pos1
+R 0 0 StoreByte [g_bytecode, pos1, rb1]
+R 0 0 Add [-1, 0] pending_fn_jmp_pos
+R 0 0 Label [c777_after_eof]
+R 0 0 Add [-1, 0] pending_fn_slot
+# Sub-C reciclaje EOF: restaurar sym_count tras cerrar F final.
+R 0 0 Lt [0, fn_slot_alloc_start] has_snap_eof
+R 0 0 Jz [has_snap_eof, c777_no_recycle]
+R 0 0 Add [fn_slot_alloc_start, 0] sym_count
+R 0 0 Add [0, 0] fn_slot_alloc_start
+R 0 0 Label [c777_no_recycle]
+# Resolve fixups + emit HALT + append str_data
+R 0 0 Call [func_resolve_fixups]
+R 0 0 Call [label_resolve_fixups]
+R 0 0 Call [bc_emit, 0]
+# Append str_data + patch fixups con abs addr
+R 0 0 Lt [0, str_data_len] hasstr
+R 0 0 Jz [hasstr, c777_no_str]
+R 0 0 Add [g_bytecode_len, 0] bc_data_start
+# scaffold_size = setup + dispatch + sum(handler) + tail + jt + vars
+R 0 0 Call [arch_setup_size] ss
+R 0 0 Call [arch_dispatch_size] ds
+R 0 0 Call [arch_tail_size] ts
+R 0 0 Call [arch_jt_entry_bytes] jte
+R 0 0 Call [arch_jmp_back_size] jbs
+R 0 0 Add [ss, ds] scaffold
+R 0 0 Add [0, 0] i
+R 0 0 Label [sc_loop]
+R 0 0 Lt [i, c_NUM_OPCODES] cond
+R 0 0 Jz [cond, sc_done]
+R 0 0 Call [arch_handler_size, i] hsz
+R 0 0 Call [arch_handler_is_halt, i] is_h
+R 0 0 Jz [is_h, sc_chk_e]
+R 0 0 Add [scaffold, jbs] scaffold
+R 0 0 Jmp [sc_next]
+R 0 0 Label [sc_chk_e]
+R 0 0 Call [arch_handler_is_exit, i] is_e
+R 0 0 Jz [is_e, sc_norm]
+R 0 0 Add [scaffold, hsz] scaffold
+R 0 0 Jmp [sc_next]
+R 0 0 Label [sc_norm]
+R 0 0 Add [scaffold, hsz] scaffold
+R 0 0 Add [scaffold, jbs] scaffold
+R 0 0 Label [sc_next]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [sc_loop]
+R 0 0 Label [sc_done]
+R 0 0 Add [scaffold, ts] scaffold
+R 0 0 Mul [c_NUM_OPCODES, jte] jts
+R 0 0 Add [scaffold, jts] scaffold
+R 0 0 Add [scaffold, c_VARS_AREA_SIZE] scaffold
+R 0 0 Call [arch_base_vaddr] bva
+R 0 0 Add [bva, c_HEADER_TOTAL] tmp1
+R 0 0 Add [tmp1, scaffold] bc_section_abs
+# patch fixups
+R 0 0 Add [0, 0] i
+R 0 0 Label [pf_loop]
+R 0 0 Lt [i, fixup_count] cond
+R 0 0 Jz [cond, pf_done]
+R 0 0 Mul [i, 8] fioff
+R 0 0 LoadI64 [fixup_data, fioff] doff
+R 0 0 LoadI64 [fixup_bc, fioff] fpos
+R 0 0 Add [bc_section_abs, bc_data_start] tmp2
+R 0 0 Add [tmp2, doff] abs_addr
+R 0 0 BitAnd [abs_addr, 255] b0
+R 0 0 StoreByte [g_bytecode, fpos, b0]
+R 0 0 Shr [abs_addr, 8] s1
+R 0 0 BitAnd [s1, 255] b1
+R 0 0 Add [fpos, 1] p1
+R 0 0 StoreByte [g_bytecode, p1, b1]
+R 0 0 Shr [abs_addr, 16] s2
+R 0 0 BitAnd [s2, 255] b2
+R 0 0 Add [fpos, 2] p2
+R 0 0 StoreByte [g_bytecode, p2, b2]
+R 0 0 Shr [abs_addr, 24] s3
+R 0 0 BitAnd [s3, 255] b3
+R 0 0 Add [fpos, 3] p3
+R 0 0 StoreByte [g_bytecode, p3, b3]
+R 0 0 Shr [abs_addr, 32] s4
+R 0 0 BitAnd [s4, 255] b4
+R 0 0 Add [fpos, 4] p4
+R 0 0 StoreByte [g_bytecode, p4, b4]
+R 0 0 Shr [abs_addr, 40] s5
+R 0 0 BitAnd [s5, 255] b5
+R 0 0 Add [fpos, 5] p5
+R 0 0 StoreByte [g_bytecode, p5, b5]
+R 0 0 Shr [abs_addr, 48] s6
+R 0 0 BitAnd [s6, 255] b6
+R 0 0 Add [fpos, 6] p6
+R 0 0 StoreByte [g_bytecode, p6, b6]
+R 0 0 Shr [abs_addr, 56] s7
+R 0 0 BitAnd [s7, 255] b7
+R 0 0 Add [fpos, 7] p7
+R 0 0 StoreByte [g_bytecode, p7, b7]
+R 0 0 Add [i, 1] i
+R 0 0 Jmp [pf_loop]
+R 0 0 Label [pf_done]
+# Append str_data to g_bytecode
+R 0 0 Add [0, 0] j
+R 0 0 Label [as_loop]
+R 0 0 Lt [j, str_data_len] cond
+R 0 0 Jz [cond, c777_no_str]
+R 0 0 LoadByte [str_data, j] b
+R 0 0 StoreByte [g_bytecode, g_bytecode_len, b]
+R 0 0 Add [g_bytecode_len, 1] g_bytecode_len
+R 0 0 Add [j, 1] j
+R 0 0 Jmp [as_loop]
+R 0 0 Label [c777_no_str]
+R 0 0 Ret []
+R 0 0 EndF
+
+# main: init + read stdin + compile + build_vm_elf + write stdout
+F 0 0 main []
+R 0 0 Call [sym_init]
+R 0 0 Call [str_init]
+R 0 0 Call [func_init]
+R 0 0 Call [label_init]
+R 0 0 Call [arch_init]
+R 0 0 Add [0, 0] g_source_len
+R 0 0 Label [main_read]
+R 0 0 Sub [c_MAX_SOURCE, g_source_len] avail
+R 0 0 Lt [0, avail] hasspace
+R 0 0 Jz [hasspace, main_compile]
+R 0 0 Add [g_source, g_source_len] dst
+R 0 0 FdRead [c_FD_STDIN, dst, avail] n
+R 0 0 Lt [n, 1] eof
+R 0 0 Jz [eof, main_read_more]
+R 0 0 Jmp [main_compile]
+R 0 0 Label [main_read_more]
+R 0 0 Add [g_source_len, n] g_source_len
+R 0 0 Jmp [main_read]
+R 0 0 Label [main_compile]
+R 0 0 Call [compile_777m_to_bytecode]
+R 0 0 Call [build_vm_elf]
+R 0 0 FdWrite [c_FD_STDOUT, g_elf, g_elf_len] w
+R 0 0 Ret []
+R 0 0 EndF
+
+# Entry point: llama main
+R 0 0 Call [main]
+R 0 0 ExitTop [0]

@@ -1,0 +1,12 @@
+D 0 0 A Integer 100
+D 0 0 B Integer 7
+D 0 0 Z Integer 0
+D 0 0 S Integer 1
+R 0 0 Div [A, B] Q
+R 0 0 Mod [A, B] M
+R 0 0 Mul [Q, B] P
+R 0 0 Add [P, M] R
+R 0 0 Eq [R, A] OK
+R 0 0 Jz [OK, 3]
+R 0 0 ExitTop [Z]
+R 0 0 ExitTop [S]

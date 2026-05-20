@@ -1,0 +1,57 @@
+# Demo 2: calculadora con dispatch del operador (+,-,*)
+# Stdin: 3 bytes "digit op digit" ej "5+3", "9-2", "4*3"
+# Exit: digit1 OP digit2.
+# Tests: "5+3" -> 8, "9-2" -> 7, "4*3" -> 12
+# Usa F + Call [name] friendly para encapsular cada operacion.
+
+D 0 0 fd_in Integer 0
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+D 0 0 two Integer 2
+D 0 0 three Integer 3
+D 0 0 nine Integer 99
+D 0 0 char_zero Integer 48
+D 0 0 char_plus Integer 43
+D 0 0 char_minus Integer 45
+D 0 0 char_star Integer 42
+D 0 0 buf_size Integer 16
+D 0 0 d1 Integer 0
+D 0 0 op Integer 0
+D 0 0 d2 Integer 0
+
+F 0 0 do_add []
+R 0 0 Add [d1, d2] result_a
+R 0 0 ExitTop [result_a]
+R 0 0 Ret []
+R 0 0 EndF
+
+F 0 0 do_sub []
+R 0 0 Sub [d1, d2] result_s
+R 0 0 ExitTop [result_s]
+R 0 0 Ret []
+R 0 0 EndF
+
+F 0 0 do_mul []
+R 0 0 Mul [d1, d2] result_m
+R 0 0 ExitTop [result_m]
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Alloc [buf_size] buf
+R 0 0 FdRead [fd_in, buf, three] read_n
+R 0 0 LoadByte [buf, zero] b0
+R 0 0 Sub [b0, char_zero] d1
+R 0 0 LoadByte [buf, one] op
+R 0 0 LoadByte [buf, two] b2
+R 0 0 Sub [b2, char_zero] d2
+
+R 0 0 Eq [op, char_plus] is_plus
+R 0 0 Jz [is_plus, 3]
+R 0 0 Call [do_add]
+R 0 0 Eq [op, char_minus] is_minus
+R 0 0 Jz [is_minus, 3]
+R 0 0 Call [do_sub]
+R 0 0 Eq [op, char_star] is_star
+R 0 0 Jz [is_star, 3]
+R 0 0 Call [do_mul]
+R 0 0 ExitTop [nine]

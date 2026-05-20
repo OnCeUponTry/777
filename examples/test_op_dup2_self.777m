@@ -1,0 +1,4 @@
+# Opcode DUP2: dup2(stdout, stdout) retorna newfd (1)
+D 0 0 one Integer 1
+R 0 0 Dup2 [one, one] result
+R 0 0 ExitTop [result]

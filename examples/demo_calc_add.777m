@@ -1,0 +1,18 @@
+# Demo 1: calculadora aritmetica add hardcoded
+# Lee 3 bytes stdin (digit+digit, ej "5+3"), exit con suma de digit[0] + digit[2]
+# Ignora el operator (siempre +).
+# Verifica: FdRead + LoadByte + Sub (ASCII->int) + Add + ExitTop
+D 0 0 fd_in Integer 0
+D 0 0 zero Integer 0
+D 0 0 two Integer 2
+D 0 0 three Integer 3
+D 0 0 char_zero Integer 48
+D 0 0 buf_size Integer 16
+R 0 0 Alloc [buf_size] buf
+R 0 0 FdRead [fd_in, buf, three] read_n
+R 0 0 LoadByte [buf, zero] b0
+R 0 0 Sub [b0, char_zero] d1
+R 0 0 LoadByte [buf, two] b2
+R 0 0 Sub [b2, char_zero] d2
+R 0 0 Add [d1, d2] result
+R 0 0 ExitTop [result]

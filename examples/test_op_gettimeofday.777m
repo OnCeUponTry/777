@@ -1,0 +1,7 @@
+# Sub-Lote3: GetTimeOfDay opcode llena struct timeval (sec, usec).
+# Retorna 0 si OK. Exit con result.
+D 0 0 zero Integer 0
+D 0 0 size Integer 16
+R 0 0 Alloc [size] tv
+R 0 0 GetTimeOfDay [tv, zero] result
+R 0 0 ExitTop [result]

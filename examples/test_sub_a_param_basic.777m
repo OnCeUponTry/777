@@ -1,0 +1,14 @@
+# Sub-A test A.5: F con params automaticos + Call con args.
+# print_int_simple [n]: setea tmp = n, retorna.
+# Call print_int_simple con 42, luego exit con tmp.
+# Exit esperado: 42
+D 0 0 zero Integer 0
+D 0 0 tmp Integer 0
+
+F 0 0 print_int_simple [n]
+R 0 0 Add [n, zero] tmp
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [print_int_simple, 42]
+R 0 0 ExitTop [tmp]

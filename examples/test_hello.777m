@@ -1,0 +1,4 @@
+D 0 0 N Integer 6
+D 0 0 msg Text "Hello\n"
+R 0 0 FdWrite [1, msg, N] R
+R 0 0 ExitTop [0]

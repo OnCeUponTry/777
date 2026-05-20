@@ -1,0 +1,10 @@
+# Sub-B: F retorna constante via Ret [val]. Caller usa result.
+# Exit 42 si Sub-B funciona correcto.
+D 0 0 result Integer 0
+
+F 0 0 forty_two []
+R 0 0 Ret [42]
+R 0 0 EndF
+
+R 0 0 Call [forty_two] result
+R 0 0 ExitTop [result]

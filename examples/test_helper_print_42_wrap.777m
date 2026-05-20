@@ -1,0 +1,31 @@
+# Misma logica que test_print_42 PERO envuelta en F (verifica F+loop+Alloc+FdWrite)
+D 0 0 N Integer 42
+D 0 0 Z Integer 0
+D 0 0 S Integer 1
+D 0 0 L Integer 10
+D 0 0 K Integer 48
+D 0 0 size Integer 64
+D 0 0 fd Integer 1
+D 0 0 nl Integer 10
+
+F 0 0 print_n []
+R 0 0 Alloc [size] buf
+D 0 0 P Integer 33
+D 0 0 C Integer 0
+R 0 0 StoreByte [buf, P, nl]
+R 0 0 Add [C, S] C
+R 0 0 Sub [P, S] P
+R 0 0 Mod [N, L] D
+R 0 0 Add [D, K] D
+R 0 0 StoreByte [buf, P, D]
+R 0 0 Add [C, S] C
+R 0 0 Div [N, L] N
+R 0 0 Eq [N, Z] E
+R 0 0 Jz [E, -54]
+R 0 0 Add [buf, P] ptr
+R 0 0 FdWrite [fd, ptr, C] R
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Call [print_n]
+R 0 0 ExitTop [Z]

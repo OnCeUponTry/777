@@ -1,0 +1,12 @@
+# GCD iterativo (Euclides): gcd(48, 36) = 12
+# while b != 0: t = a mod b; a = b; b = t
+# Body: Mod (7) + Add [b,Z] a (7) + Add [t,Z] b (7) + Eq [b,Z] done (7) + Jz (5) = 33
+D 0 0 a Integer 48
+D 0 0 b Integer 36
+D 0 0 Z Integer 0
+R 0 0 Mod [a, b] t
+R 0 0 Add [b, Z] a
+R 0 0 Add [t, Z] b
+R 0 0 Eq [b, Z] done
+R 0 0 Jz [done, -33]
+R 0 0 ExitTop [a]

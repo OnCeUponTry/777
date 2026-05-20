@@ -1,0 +1,12 @@
+# Sub-B: F suma a+b via params + Ret [sum]. Caller usa result.
+# add(7, 35) -> sum=42, exit 42.
+D 0 0 result Integer 0
+D 0 0 sum Integer 0
+
+F 0 0 add [a, b]
+R 0 0 Add [a, b] sum
+R 0 0 Ret [sum]
+R 0 0 EndF
+
+R 0 0 Call [add, 7, 35] result
+R 0 0 ExitTop [result]

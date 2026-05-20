@@ -1,0 +1,8 @@
+# Opcodes ALLOC + STORE_BYTE + LOAD_BYTE: heap write+read byte 'A'=65
+D 0 0 size Integer 64
+D 0 0 off Integer 0
+D 0 0 val Integer 65
+R 0 0 Alloc [size] buf
+R 0 0 StoreByte [buf, off, val]
+R 0 0 LoadByte [buf, off] R
+R 0 0 ExitTop [R]

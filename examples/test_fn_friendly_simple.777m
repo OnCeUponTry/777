@@ -1,0 +1,12 @@
+# Item 2: sintaxis F + Call [name] con forward reference
+# Funcion add_eight modifica slot X sumando 8.
+# Programa: X=50; Call [add_eight] (forward); ExitTop [X] -> exit 58
+D 0 0 X Integer 50
+D 0 0 Z Integer 0
+D 0 0 Eight Integer 8
+R 0 0 Call [add_eight]
+R 0 0 ExitTop [X]
+F 0 0 add_eight []
+R 0 0 Add [X, Eight] X
+R 0 0 Ret []
+R 0 0 EndF

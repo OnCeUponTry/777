@@ -1,0 +1,12 @@
+# Opcode NANOSLEEP: dormir 1ms (1_000_000 ns), exit 0
+# timespec = {tv_sec: i64 @ off 0, tv_nsec: i64 @ off 8} = 16 bytes
+D 0 0 size Integer 16
+D 0 0 zero Integer 0
+D 0 0 ns Integer 1000000
+D 0 0 off_sec Integer 0
+D 0 0 off_nsec Integer 8
+R 0 0 Alloc [size] req
+R 0 0 StoreI64 [req, off_sec, zero]
+R 0 0 StoreI64 [req, off_nsec, ns]
+R 0 0 Nanosleep [req, zero] R
+R 0 0 ExitTop [zero]

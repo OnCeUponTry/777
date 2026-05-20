@@ -1,0 +1,12 @@
+# Factorial iterativo: 5! = 120
+# Loop: result*=n; n--; while n != 0
+# Body bytecode: Mul (7) + Sub (7) + Eq (7) + Jz (5) = 26B
+D 0 0 result Integer 1
+D 0 0 n Integer 5
+D 0 0 Z Integer 0
+D 0 0 One Integer 1
+R 0 0 Mul [result, n] result
+R 0 0 Sub [n, One] n
+R 0 0 Eq [n, Z] done
+R 0 0 Jz [done, -26]
+R 0 0 ExitTop [result]

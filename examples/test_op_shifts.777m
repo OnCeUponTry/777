@@ -1,0 +1,7 @@
+# Opcodes SHL/SHR: (1 << 6) >> 1 = 64 >> 1 = 32
+D 0 0 A Integer 1
+D 0 0 Six Integer 6
+D 0 0 One Integer 1
+R 0 0 Shl [A, Six] X
+R 0 0 Shr [X, One] R
+R 0 0 ExitTop [R]

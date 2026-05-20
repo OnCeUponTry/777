@@ -1,0 +1,61 @@
+# Demo 3: menu navegable simple
+# Imprime menu, lee 1 byte, dispatch:
+#   '1' -> imprime "Hello\n", exit 0
+#   '2' -> imprime "Calc!\n", exit 0
+#   '3' -> exit 0 (Quit silencioso)
+#   otro -> exit 99
+
+D 0 0 fd_in Integer 0
+D 0 0 fd_out Integer 1
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+D 0 0 nine Integer 99
+D 0 0 char_1 Integer 49
+D 0 0 char_2 Integer 50
+D 0 0 char_3 Integer 51
+D 0 0 buf_size Integer 16
+D 0 0 c Integer 0
+
+D 0 0 menu_text Text "[1] Hello [2] Calc [3] Quit > "
+D 0 0 menu_len Integer 30
+D 0 0 hello_text Text "Hello, 777!\n"
+D 0 0 hello_len Integer 12
+D 0 0 calc_text Text "Calc!\n"
+D 0 0 calc_len Integer 6
+
+F 0 0 print_menu []
+R 0 0 FdWrite [fd_out, menu_text, menu_len] r_pm
+R 0 0 Ret []
+R 0 0 EndF
+
+F 0 0 do_hello []
+R 0 0 FdWrite [fd_out, hello_text, hello_len] r_dh
+R 0 0 ExitTop [zero]
+R 0 0 Ret []
+R 0 0 EndF
+
+F 0 0 do_calc []
+R 0 0 FdWrite [fd_out, calc_text, calc_len] r_dc
+R 0 0 ExitTop [zero]
+R 0 0 Ret []
+R 0 0 EndF
+
+F 0 0 do_quit []
+R 0 0 ExitTop [zero]
+R 0 0 Ret []
+R 0 0 EndF
+
+R 0 0 Alloc [buf_size] buf
+R 0 0 Call [print_menu]
+R 0 0 FdRead [fd_in, buf, one] read_n
+R 0 0 LoadByte [buf, zero] c
+R 0 0 Eq [c, char_1] is_1
+R 0 0 Jz [is_1, 3]
+R 0 0 Call [do_hello]
+R 0 0 Eq [c, char_2] is_2
+R 0 0 Jz [is_2, 3]
+R 0 0 Call [do_calc]
+R 0 0 Eq [c, char_3] is_3
+R 0 0 Jz [is_3, 3]
+R 0 0 Call [do_quit]
+R 0 0 ExitTop [nine]

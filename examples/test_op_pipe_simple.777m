@@ -1,0 +1,5 @@
+# Opcode PIPE: crea pipe, retorna 0 si OK
+D 0 0 size Integer 16
+R 0 0 Alloc [size] fds_buf
+R 0 0 Pipe [fds_buf] result
+R 0 0 ExitTop [result]

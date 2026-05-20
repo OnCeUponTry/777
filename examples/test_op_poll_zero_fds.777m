@@ -1,0 +1,6 @@
+# Opcode POLL: nfds=0, timeout=0, retorna 0 inmediato (sin esperar)
+D 0 0 zero Integer 0
+D 0 0 size Integer 16
+R 0 0 Alloc [size] fds_buf
+R 0 0 Poll [fds_buf, zero, zero] result
+R 0 0 ExitTop [result]

@@ -1,0 +1,7 @@
+# Opcode FD_WRITE: imprime "X" a stdout, exit 0
+D 0 0 fd Integer 1
+D 0 0 n Integer 1
+D 0 0 msg Text "X"
+D 0 0 Z Integer 0
+R 0 0 FdWrite [fd, msg, n] R
+R 0 0 ExitTop [Z]

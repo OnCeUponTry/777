@@ -1,0 +1,10 @@
+# Sub-Lote1: Socket opcode crea fd valido (>=0), Close lo cierra.
+# Si Socket funciona, fd >= 0. Exit con fd (esperamos >= 3, primer fd post stdin/out/err).
+# AF_INET=2, SOCK_STREAM=1, protocol=0 (auto TCP)
+D 0 0 family Integer 2
+D 0 0 type Integer 1
+D 0 0 protocol Integer 0
+D 0 0 zero Integer 0
+R 0 0 Socket [family, type, protocol] fd
+R 0 0 Close [fd] r
+R 0 0 ExitTop [zero]

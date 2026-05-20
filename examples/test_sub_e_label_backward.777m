@@ -1,0 +1,10 @@
+# Sub-E: loop con Label backward jump sin rel manual.
+# Cuenta down 5 -> 0, exit 0.
+D 0 0 n Integer 5
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+R 0 0 Label [loop_start]
+R 0 0 Sub [n, one] n
+R 0 0 Eq [n, zero] done
+R 0 0 Jz [done, loop_start]
+R 0 0 ExitTop [n]

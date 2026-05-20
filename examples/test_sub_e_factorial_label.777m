@@ -1,0 +1,12 @@
+# Sub-E: factorial iterativo con Label friendly (sin rel manual).
+# 5! = 120
+D 0 0 result Integer 1
+D 0 0 n Integer 5
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+R 0 0 Label [fact_loop]
+R 0 0 Mul [result, n] result
+R 0 0 Sub [n, one] n
+R 0 0 Eq [n, zero] done
+R 0 0 Jz [done, fact_loop]
+R 0 0 ExitTop [result]

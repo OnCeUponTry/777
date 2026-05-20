@@ -1,0 +1,13 @@
+# Sub-Lote1: Socket retorna fd >= 0 (no error).
+# Exit con 1 si fd valido, 0 si fd negativo (error).
+D 0 0 family Integer 2
+D 0 0 type Integer 1
+D 0 0 protocol Integer 0
+D 0 0 zero Integer 0
+D 0 0 one Integer 1
+R 0 0 Socket [family, type, protocol] fd
+# fd negativo si error: Lt [fd, zero] -> 1 si fd<0
+R 0 0 Lt [fd, zero] is_error
+R 0 0 Sub [one, is_error] is_ok
+R 0 0 Close [fd] r
+R 0 0 ExitTop [is_ok]
